@@ -1,0 +1,6 @@
+{
+  "name": "Termux NodePanel",
+  "description": "Lightweight, modular Node.js process & server management panel tailored for native Termux, proot-distro, and Linux environments.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}

@@ -1,0 +1,98 @@
+{
+  "servers": [
+    {
+      "id": "srv-22559-94a65378",
+      "name": "Live Production Test",
+      "description": "",
+      "port": 3400,
+      "entry_file": "index.js",
+      "start_script": "start",
+      "status": "stopped",
+      "auto_restart": "never",
+      "env_vars": {
+        "PORT": "3400",
+        "NODE_ENV": "production",
+        "API_SECRET_KEY": "secret_token_abc",
+        "DATABASE_URL": "mongodb://localhost:27017/test"
+      },
+      "created_at": "2026-10-24T06:15:59Z",
+      "updated_at": "2026-10-24T08:29:44.584Z",
+      "repo_url": "",
+      "last_exit_code": 1
+    }
+  ],
+  "activities": [
+    {
+      "id": "17928305845843xkj",
+      "timestamp": "2026-10-24T08:29:44.584Z",
+      "action": "stop_server",
+      "server_id": "srv-22559-94a65378",
+      "details": "Server stopped gracefully",
+      "status": "success"
+    },
+    {
+      "id": "17928305835432y7w",
+      "timestamp": "2026-10-24T08:29:43.543Z",
+      "action": "start_server",
+      "server_id": "srv-22559-94a65378",
+      "details": "Server 'Live Production Test' started (PID: 1681)",
+      "status": "success"
+    },
+    {
+      "id": "1792829009033dx0y",
+      "timestamp": "2026-10-24T08:03:29.033Z",
+      "action": "rename_file",
+      "server_id": "srv-22559-94a65378",
+      "details": "Renamed testdir to renamed_dir",
+      "status": "success"
+    },
+    {
+      "id": "1792828999176dc2j",
+      "timestamp": "2026-10-24T08:03:19.176Z",
+      "action": "update_env",
+      "server_id": "srv-22559-94a65378",
+      "details": "Updated environment variables (4 entries)",
+      "status": "success"
+    },
+    {
+      "id": "1792828190008vcel",
+      "timestamp": "2026-10-24T07:49:50.008Z",
+      "action": "stop_server",
+      "server_id": "srv-22559-94a65378",
+      "details": "Server stopped gracefully",
+      "status": "success"
+    },
+    {
+      "id": "1792828188964gkf6",
+      "timestamp": "2026-10-24T07:49:48.964Z",
+      "action": "start_server",
+      "server_id": "srv-22559-94a65378",
+      "details": "Server 'Live Production Test' started (PID: 413)",
+      "status": "success"
+    },
+    {
+      "id": "1792822559498118463",
+      "timestamp": "2026-10-24T06:15:59Z",
+      "action": "create_server",
+      "server_id": "srv-22559-94a65378",
+      "details": "Created server 'Live Production Test' on port 3400",
+      "status": "success"
+    },
+    {
+      "id": "1792822565721147884",
+      "timestamp": "2026-10-24T06:16:05Z",
+      "action": "start_server",
+      "server_id": "srv-22559-94a65378",
+      "details": "Server started",
+      "status": "success"
+    },
+    {
+      "id": "1792822567869996174",
+      "timestamp": "2026-10-24T06:16:07Z",
+      "action": "stop_server",
+      "server_id": "srv-22559-94a65378",
+      "details": "Server stopped gracefully",
+      "status": "success"
+    }
+  ]
+}
