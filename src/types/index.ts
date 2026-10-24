@@ -163,3 +163,30 @@ export interface ToastItem {
   description?: string;
   variant: 'success' | 'error' | 'warning' | 'info';
 }
+
+export type JobStatus = 'queued' | 'running' | 'completed' | 'failed' | 'cancelled' | 'timed_out';
+export type JobCategory = 'install' | 'build' | 'test' | 'git' | 'command' | 'custom';
+
+export interface JobOutputLine {
+  seq: number;
+  timestamp: string;
+  stream: 'stdout' | 'stderr' | 'system' | 'command';
+  text: string;
+}
+
+export interface JobModel {
+  id: string;
+  serverId: string;
+  serverName?: string;
+  command: string;
+  category: JobCategory;
+  status: JobStatus;
+  startTime: string;
+  endTime?: string;
+  durationMs?: number;
+  exitCode: number | null;
+  signal?: string | null;
+  cwd: string;
+  output?: JobOutputLine[];
+  pid?: number;
+}

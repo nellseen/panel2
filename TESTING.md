@@ -59,6 +59,8 @@ npx playwright install --with-deps chromium
    - `applyServerStatusUpdate` & `reconcileServerList` non-destructive merging, `WebSocketClient` exponential backoff scheduling, deterministic timer cleanup on `disconnect()` (zero zombie reconnects), ref-counted server subscriptions, and reconnect state reconciliation without command replay.
 4. `tests/unit/ui-and-resilience.test.tsx` (7 tests):
    - `Button` loading-state double-submit prevention, `Modal` `Escape` & `preventClose` handling, `ConfirmDialog` safety before confirmation, WAI-ARIA `Tabs` `ArrowRight`/`ArrowLeft` keyboard navigation, `StatusPill` & `ConnectionStatus` rendering, `<ErrorBoundary>` widget crash isolation + reset, and **Bug A Regression Test** proving `<App />` preserves rendered server cards and displays a stale-data warning banner when `GET /api/servers` returns `503`.
+5. `tests/unit/terminal-ansi-and-jobs.test.ts` (4 tests):
+   - ANSI escape sequence color parsing (standard 16 colors, bright colors, bold, dim, italic, underline, compound SGR codes), control sequence stripping, multiline carriage return (`\r`) overwriting for progress bars, and contiguous styled span extraction.
 
 ### Stage 3 — Integration Tests (`tests/integration/api-ws-lifecycle.test.ts`)
 1. **Health & Non-Blocking Runtime Telemetry**: Verifies `/api/health` and `/api/runtime` return real OS/filesystem metrics (`memory_total_mb`, `disk_free_mb`, `executables.node`) cleanly under `<500ms`.

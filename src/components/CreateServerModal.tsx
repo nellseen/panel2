@@ -57,14 +57,15 @@ export const CreateServerModal: React.FC<CreateServerModalProps> = ({
   const [gitName, setGitName] = useState('');
   const [autoInstall, setAutoInstall] = useState(true);
   const [gitLogs, setGitLogs] = useState('');
+  const userEditedGitNameRef = React.useRef(false);
 
-  const resetAndClose = () => {
+  const resetAndClose = React.useCallback(() => {
     if (loading) return;
     setFormError(null);
     setFieldErrors({});
     setGitLogs('');
     onClose();
-  };
+  }, [loading, onClose]);
 
   const handleCreateTemplate = async (e: React.FormEvent) => {
     e.preventDefault();
@@ -209,6 +210,7 @@ export const CreateServerModal: React.FC<CreateServerModalProps> = ({
         {mode === 'template' ? (
           <form id={formId} onSubmit={handleCreateTemplate} noValidate className="space-y-4">
             <Input
+              id="create-server-name"
               label="Server Name"
               required
               placeholder="e.g. Webhook Gateway API"
@@ -222,6 +224,7 @@ export const CreateServerModal: React.FC<CreateServerModalProps> = ({
 
             <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
               <Input
+                id="create-server-port"
                 label="Listening Port"
                 type="number"
                 min={1024}
@@ -236,6 +239,7 @@ export const CreateServerModal: React.FC<CreateServerModalProps> = ({
               />
 
               <Select
+                id="create-server-autorestart"
                 label="Auto-Restart Policy"
                 value={autoRestart}
                 onChange={(e) => setAutoRestart(e.target.value as AutoRestartPolicy)}
@@ -277,15 +281,20 @@ export const CreateServerModal: React.FC<CreateServerModalProps> = ({
             />
 
             <Input
+              id="create-server-entry"
               label="Entry Command / File"
               mono
               value={entryFile}
               error={fieldErrors.entry}
               description="Relative file (e.g. index.js) or npm start / npm run <script>."
-              onChange={(e) => setEntryFile(e.target.value)}
+              onChange={(e) => {
+                setEntryFile(e.target.value);
+                if (fieldErrors.entry) setFieldErrors((p) => ({ ...p, entry: '' }));
+              }}
             />
 
             <Textarea
+              id="create-server-description"
               label="Description"
               rows={2}
               placeholder="Optional notes about service purpose or upstream dependencies..."
@@ -296,6 +305,7 @@ export const CreateServerModal: React.FC<CreateServerModalProps> = ({
         ) : (
           <form id={formId} onSubmit={handleGitClone} noValidate className="space-y-4">
             <Input
+              id="create-git-repo-url"
               label="Git Repository URL"
               required
               mono
@@ -303,27 +313,47 @@ export const CreateServerModal: React.FC<CreateServerModalProps> = ({
               value={repoUrl}
               error={fieldErrors.repoUrl}
               onChange={(e) => {
-                setRepoUrl(e.target.value);
+                const val = e.target.value;
+                setRepoUrl(val);
                 if (fieldErrors.repoUrl) setFieldErrors((p) => ({ ...p, repoUrl: '' }));
+                if (!userEditedGitNameRef.current && val) {
+                  const segments = val.split('/').filter(Boolean);
+                  const last = segments[segments.length - 1];
+                  if (last) {
+                    const derived = last.replace(/\.git$/i, '').trim();
+                    if (derived && !derived.includes(':') && derived !== 'github.com' && derived !== 'gitlab.com') {
+                      setGitName(derived);
+                    }
+                  }
+                }
               }}
             />
 
             <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
               <Input
+                id="create-git-instance-name"
                 label="Instance Name"
                 placeholder="Defaults to repository name"
                 value={gitName}
                 error={fieldErrors.gitName}
-                onChange={(e) => setGitName(e.target.value)}
+                onChange={(e) => {
+                  userEditedGitNameRef.current = true;
+                  setGitName(e.target.value);
+                  if (fieldErrors.gitName) setFieldErrors((p) => ({ ...p, gitName: '' }));
+                }}
               />
 
               <Input
+                id="create-git-branch"
                 label="Branch"
                 mono
                 placeholder="main"
                 value={branch}
                 error={fieldErrors.branch}
-                onChange={(e) => setBranch(e.target.value)}
+                onChange={(e) => {
+                  setBranch(e.target.value);
+                  if (fieldErrors.branch) setFieldErrors((p) => ({ ...p, branch: '' }));
+                }}
               />
             </div>
 

@@ -6,6 +6,8 @@ import { DashboardView } from './components/DashboardView';
 import { ServerListView } from './components/ServerListView';
 import { CreateServerModal } from './components/CreateServerModal';
 import { Alert, Button, ErrorBoundary, Skeleton, ToastViewport } from './components/ui';
+import { JobProvider, useJobs } from './context/JobContext';
+import { RunningJobsModal } from './components/RunningJobsModal';
 
 const ServerDetailView = lazy(() =>
   import('./components/ServerDetailView').then((m) => ({ default: m.ServerDetailView }))
@@ -334,6 +336,109 @@ export default function App() {
     : null;
 
   return (
+    <JobProvider activeServerId={activeServerId} onNotify={pushToast}>
+      <AppContent
+        currentTab={currentTab}
+        setCurrentTab={setCurrentTab}
+        activeServerId={activeServerId}
+        setActiveServerId={setActiveServerId}
+        runtime={runtime}
+        servers={servers}
+        activities={activities}
+        initialLoading={initialLoading}
+        isRefreshing={isRefreshing}
+        isStale={isStale}
+        syncError={syncError}
+        lastSyncedAt={lastSyncedAt}
+        connectionSnap={connectionSnap}
+        pendingActions={pendingActions}
+        isCreateModalOpen={isCreateModalOpen}
+        setIsCreateModalOpen={setIsCreateModalOpen}
+        isMobileSidebarOpen={isMobileSidebarOpen}
+        setIsMobileSidebarOpen={setIsMobileSidebarOpen}
+        toasts={toasts}
+        pushToast={pushToast}
+        dismissToast={dismissToast}
+        syncAll={syncAll}
+        handleStartServer={handleStartServer}
+        handleStopServer={handleStopServer}
+        handleRestartServer={handleRestartServer}
+        handleDeleteServer={handleDeleteServer}
+        handleCreateServer={handleCreateServer}
+        getCurrentFeatureName={getCurrentFeatureName}
+        activeServerSummary={activeServerSummary}
+      />
+    </JobProvider>
+  );
+}
+
+interface AppContentProps {
+  currentTab: TabType;
+  setCurrentTab: (tab: TabType) => void;
+  activeServerId: string | null;
+  setActiveServerId: (id: string | null) => void;
+  runtime: EnvironmentInfo | null;
+  servers: ServerModel[];
+  activities: ActivityLog[];
+  initialLoading: boolean;
+  isRefreshing: boolean;
+  isStale: boolean;
+  syncError: string | null;
+  lastSyncedAt: string | null;
+  connectionSnap: ConnectionSnapshot;
+  pendingActions: Record<string, PendingServerAction>;
+  isCreateModalOpen: boolean;
+  setIsCreateModalOpen: (open: boolean) => void;
+  isMobileSidebarOpen: boolean;
+  setIsMobileSidebarOpen: React.Dispatch<React.SetStateAction<boolean>>;
+  toasts: ToastItem[];
+  pushToast: (title: string, variant?: ToastItem['variant'], description?: string) => void;
+  dismissToast: (id: string) => void;
+  syncAll: (opts?: { silent?: boolean }) => Promise<void>;
+  handleStartServer: (serverId: string) => Promise<void>;
+  handleStopServer: (serverId: string) => Promise<void>;
+  handleRestartServer: (serverId: string) => Promise<void>;
+  handleDeleteServer: (serverId: string) => Promise<void>;
+  handleCreateServer: (payload: CreateServerPayload) => Promise<void>;
+  getCurrentFeatureName: () => string;
+  activeServerSummary: ServerModel | null;
+}
+
+function AppContent({
+  currentTab,
+  setCurrentTab,
+  activeServerId,
+  setActiveServerId,
+  runtime,
+  servers,
+  activities,
+  initialLoading,
+  isRefreshing,
+  isStale,
+  syncError,
+  lastSyncedAt,
+  connectionSnap,
+  pendingActions,
+  isCreateModalOpen,
+  setIsCreateModalOpen,
+  isMobileSidebarOpen,
+  setIsMobileSidebarOpen,
+  toasts,
+  pushToast,
+  dismissToast,
+  syncAll,
+  handleStartServer,
+  handleStopServer,
+  handleRestartServer,
+  handleDeleteServer,
+  handleCreateServer,
+  getCurrentFeatureName,
+  activeServerSummary,
+}: AppContentProps) {
+  const { isJobsModalOpen, closeJobsModal } = useJobs();
+  const [isSidebarCollapsed, setIsSidebarCollapsed] = useState(false);
+
+  return (
     <div className="min-h-[100dvh] h-[100dvh] bg-[#08090B] text-[#F3F5F8] flex flex-col overflow-hidden antialiased selection:bg-emerald-500/25 selection:text-emerald-200">
       <Navbar
         runtime={runtime}
@@ -361,9 +466,11 @@ export default function App() {
           onOpenCreate={() => setIsCreateModalOpen(true)}
           isOpenMobile={isMobileSidebarOpen}
           onCloseMobile={() => setIsMobileSidebarOpen(false)}
+          isCollapsed={isSidebarCollapsed}
+          onToggleCollapse={() => setIsSidebarCollapsed((v) => !v)}
         />
 
-        <main className="flex-1 overflow-y-auto px-4 py-5 sm:px-6 lg:px-8 pb-20 lg:pb-8">
+        <main className="flex-1 overflow-y-auto px-4 py-5 sm:px-6 lg:px-8 pb-28 lg:pb-8">
           <div className="max-w-[1360px] mx-auto space-y-6">
             {isStale && syncError && (
               <Alert
@@ -476,6 +583,12 @@ export default function App() {
           void syncAll({ silent: true });
           setActiveServerId(serverId);
         }}
+      />
+
+      <RunningJobsModal
+        isOpen={isJobsModalOpen}
+        onClose={closeJobsModal}
+        onSelectServer={(serverId) => setActiveServerId(serverId)}
       />
 
       <ToastViewport toasts={toasts} onDismiss={dismissToast} />

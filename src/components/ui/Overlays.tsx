@@ -34,12 +34,20 @@ export const Modal: React.FC<ModalProps> = ({
   const dialogRef = useRef<HTMLDivElement>(null);
   const previousFocusRef = useRef<HTMLElement | null>(null);
 
+  const onCloseRef = useRef(onClose);
+  const preventCloseRef = useRef(preventClose);
+
+  useEffect(() => {
+    onCloseRef.current = onClose;
+    preventCloseRef.current = preventClose;
+  });
+
   useEffect(() => {
     if (!isOpen) return;
 
     previousFocusRef.current = document.activeElement as HTMLElement | null;
 
-    // Focus first interactive element inside modal unless an element already requested autoFocus
+    // Focus first interactive element inside modal only when modal is initially opened
     const timer = window.setTimeout(() => {
       if (!dialogRef.current) return;
       if (dialogRef.current.contains(document.activeElement)) return;
@@ -50,9 +58,9 @@ export const Modal: React.FC<ModalProps> = ({
     }, 10);
 
     const handleKeyDown = (event: KeyboardEvent) => {
-      if (event.key === 'Escape' && !preventClose) {
+      if (event.key === 'Escape' && !preventCloseRef.current) {
         event.stopPropagation();
-        onClose();
+        onCloseRef.current();
         return;
       }
 
@@ -82,7 +90,7 @@ export const Modal: React.FC<ModalProps> = ({
       document.removeEventListener('keydown', handleKeyDown);
       previousFocusRef.current?.focus?.();
     };
-  }, [isOpen, preventClose, onClose]);
+  }, [isOpen]);
 
   if (!isOpen) return null;
 

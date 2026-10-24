@@ -1,7 +1,8 @@
 import React from 'react';
-import { Menu, Plus, RefreshCw, Terminal } from 'lucide-react';
+import { Activity, Menu, Plus, RefreshCw, Terminal } from 'lucide-react';
 import { ConnectionState, EnvironmentInfo } from '../types';
 import { Button, ConnectionStatus, IconButton, MetaRow } from './ui';
+import { useJobs } from '../context/JobContext';
 
 export interface NavbarProps {
   runtime: EnvironmentInfo | null;
@@ -28,6 +29,8 @@ export const Navbar: React.FC<NavbarProps> = ({
   onToggleMobileSidebar,
   currentFeatureName,
 }) => {
+  const { runningJobs, openJobsModal } = useJobs();
+
   return (
     <header className="h-14 bg-[#0B0D10] border-b border-[#1A1E26] px-4 lg:px-6 flex items-center justify-between shrink-0 z-30">
       <div className="flex items-center gap-3 min-w-0">
@@ -68,6 +71,27 @@ export const Navbar: React.FC<NavbarProps> = ({
       </div>
 
       <div className="flex items-center gap-2.5 shrink-0">
+        {/* Running Jobs Global Center Indicator */}
+        <button
+          type="button"
+          onClick={openJobsModal}
+          title="Open Background Jobs Center"
+          className={`flex items-center gap-1.5 px-2.5 py-1 rounded-lg text-xs font-medium border transition-colors ${
+            runningJobs.length > 0
+              ? 'bg-amber-500/10 border-amber-500/30 text-amber-300 hover:bg-amber-500/20'
+              : 'bg-[#12151B] border-[#242A35] text-[#8A94A6] hover:text-[#F3F5F8] hover:bg-[#1A1F29]'
+          }`}
+        >
+          {runningJobs.length > 0 ? (
+            <span className="w-2 h-2 rounded-full bg-amber-400 animate-pulse shrink-0" />
+          ) : (
+            <Activity className="w-3.5 h-3.5 shrink-0 text-[#697386]" />
+          )}
+          <span className="font-mono text-[11px] tabular-nums">
+            {runningJobs.length > 0 ? `${runningJobs.length} Running` : 'Jobs'}
+          </span>
+        </button>
+
         <div className="hidden xs:flex sm:flex items-center pr-1">
           <ConnectionStatus
             state={connectionState}

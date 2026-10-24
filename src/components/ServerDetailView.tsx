@@ -28,6 +28,7 @@ import {
   AutoRestartPolicy,
   EnvInspectResult,
   FileEntry,
+  JobOutputLine,
   LogLine,
   PendingServerAction,
   ServerModel,
@@ -38,6 +39,7 @@ import {
 import {
   createServerDirectory,
   deleteServerFile,
+  fetchJobs,
   fetchServer,
   fetchServerEnv,
   fetchServerFiles,
@@ -52,6 +54,7 @@ import {
   writeServerFile,
   wsClient,
 } from '../services/api';
+import { TerminalOutput } from './TerminalOutput';
 import {
   Alert,
   Badge,
@@ -161,8 +164,6 @@ export const ServerDetailView: React.FC<ServerDetailViewProps> = ({
   const [isTerminalRunning, setIsTerminalRunning] = useState(false);
   const [currentRunningCmd, setCurrentRunningCmd] = useState('');
   const [terminalCwd, setTerminalCwd] = useState('.');
-  const [terminalAutoScroll, setTerminalAutoScroll] = useState(true);
-  const terminalBottomRef = useRef<HTMLDivElement>(null);
 
   // --- TAB 2: File Manager ---
   const [currentPath, setCurrentPath] = useState('');
@@ -355,6 +356,27 @@ export const ServerDetailView: React.FC<ServerDetailViewProps> = ({
       ]);
     });
 
+    const unsubJobOutput = wsClient.on<{
+      jobId: string;
+      serverId: string;
+      line: JobOutputLine;
+    }>('job_output', (payload) => {
+      if (payload?.serverId !== serverId) return;
+      setTerminalLines((prev) => {
+        const id = `job-${payload.jobId}-${payload.line.seq}`;
+        if (prev.some((l) => l.id === id)) return prev;
+        return [
+          ...prev.slice(-999),
+          {
+            id,
+            timestamp: payload.line.timestamp,
+            stream: payload.line.stream === 'stderr' ? 'stderr' : 'stdout',
+            text: payload.line.text,
+          },
+        ];
+      });
+    });
+
     const unsubTermExit = wsClient.on<{
       serverId: string;
       cwd?: string;
@@ -363,6 +385,16 @@ export const ServerDetailView: React.FC<ServerDetailViewProps> = ({
       setIsTerminalRunning(false);
       setCurrentRunningCmd('');
       if (payload.cwd) setTerminalCwd(payload.cwd);
+    });
+
+    const unsubJobFinished = wsClient.on<{
+      jobId: string;
+      serverId: string;
+      status: string;
+    }>('job_finished', (payload) => {
+      if (payload?.serverId !== serverId) return;
+      setIsTerminalRunning(false);
+      setCurrentRunningCmd('');
     });
 
     const unsubTermState = wsClient.on<{
@@ -387,6 +419,31 @@ export const ServerDetailView: React.FC<ServerDetailViewProps> = ({
       void loadData();
     });
 
+    // Hydrate existing/active jobs for this server so terminal doesn't lose logs across tabs
+    void fetchJobs({ serverId }).then((res) => {
+      if (!res?.jobs || res.jobs.length === 0) return;
+      const activeOrRecent = res.jobs.find((j) => j.status === 'running' || j.status === 'queued') || res.jobs[0];
+      if (activeOrRecent) {
+        if (activeOrRecent.status === 'running' || activeOrRecent.status === 'queued') {
+          setIsTerminalRunning(true);
+          setCurrentRunningCmd(activeOrRecent.command);
+        }
+        if (activeOrRecent.output && activeOrRecent.output.length > 0) {
+          const replayLines: TerminalLine[] = activeOrRecent.output.map((o) => ({
+            id: `job-${activeOrRecent.id}-${o.seq}`,
+            timestamp: o.timestamp,
+            stream: o.stream === 'stderr' ? 'stderr' : 'stdout',
+            text: o.text,
+          }));
+          setTerminalLines((prev) => {
+            const existingIds = new Set(prev.map((l) => l.id));
+            const fresh = replayLines.filter((l) => !existingIds.has(l.id));
+            return [...prev, ...fresh].slice(-1000);
+          });
+        }
+      }
+    }).catch(() => {});
+
     return () => {
       globalThis.clearTimeout(initTimer);
       controller.abort();
@@ -395,18 +452,15 @@ export const ServerDetailView: React.FC<ServerDetailViewProps> = ({
       unsubStatus();
       unsubTermStart();
       unsubTermData();
+      unsubJobOutput();
       unsubTermExit();
+      unsubJobFinished();
       unsubTermState();
       unsubTermClear();
       unsubReconnect();
     };
   }, [loadData, serverId]);
 
-  useEffect(() => {
-    if (terminalAutoScroll && activeTab === 'terminal') {
-      terminalBottomRef.current?.scrollIntoView?.({ behavior: 'auto' });
-    }
-  }, [terminalLines, terminalAutoScroll, activeTab]);
 
   useEffect(() => {
     if (autoScrollLogs && activeTab === 'logs') {
@@ -779,19 +833,23 @@ export const ServerDetailView: React.FC<ServerDetailViewProps> = ({
   const handleRunNpmInstall = async () => {
     try {
       setIsInstallingDeps(true);
-      notify('Running npm install...', 'info');
+      notify('Starting npm install in background...', 'info');
+      setActiveTab('terminal');
       const res = await installServerDeps(serverId);
-      notify('npm install completed', 'success');
-      setTerminalLines((prev) => [
-        ...prev.slice(-999),
-        {
-          id: `npm-${Date.now()}`,
-          timestamp: new Date().toISOString(),
-          stream: 'system',
-          text: `[nodepanel-deps] npm install completed:\n${res.output}`,
-        },
-      ]);
-      await loadData();
+      if (res?.jobId) {
+        notify('npm install job spawned', 'info', `Job ID: ${res.jobId}`);
+      }
+      if (res?.output) {
+        setTerminalLines((prev) => [
+          ...prev.slice(-999),
+          {
+            id: `npm-${Date.now()}`,
+            timestamp: new Date().toISOString(),
+            stream: 'system',
+            text: `[nodepanel-deps] npm install completed:\n${res.output}`,
+          },
+        ]);
+      }
     } catch (err: unknown) {
       notify('npm install failed', 'error', normalizeError(err).message);
     } finally {
@@ -991,8 +1049,8 @@ export const ServerDetailView: React.FC<ServerDetailViewProps> = ({
 
       {/* TAB 1: LIVE INTERACTIVE TERMINAL */}
       {activeTab === 'terminal' && (
-        <Card padding="none" className="overflow-hidden flex flex-col h-[540px]">
-          <div className="px-4 py-2.5 bg-[#0B0D10] border-b border-[#1F242D] flex items-center justify-between flex-wrap gap-2">
+        <Card padding="none" className="overflow-hidden flex flex-col h-[560px]">
+          <div className="px-4 py-2.5 bg-[#0B0D10] border-b border-[#1F242D] flex items-center justify-between flex-wrap gap-2 shrink-0">
             <div className="flex items-center gap-2 font-mono text-xs text-[#A2AAB8] min-w-0">
               <Terminal className="w-3.5 h-3.5 text-emerald-400 shrink-0" aria-hidden="true" />
               <span className="text-[#697386]">cwd:</span>
@@ -1013,49 +1071,25 @@ export const ServerDetailView: React.FC<ServerDetailViewProps> = ({
                 </div>
               )}
 
-              <Switch
-                checked={terminalAutoScroll}
-                onChange={setTerminalAutoScroll}
-                label="Auto-scroll"
-              />
-
               <Button variant="ghost" size="sm" onClick={() => setTerminalLines([])}>
                 Clear
               </Button>
             </div>
           </div>
 
-          <div
-            data-testid="terminal-output"
-            className="flex-1 p-4 overflow-y-auto font-mono text-xs bg-[#060709] space-y-1 select-text"
-          >
-            {terminalLines.length === 0 ? (
-              <div className="text-[#5B6475] py-6 text-center">Terminal buffer cleared.</div>
-            ) : (
-              terminalLines.map((line) => {
-                const textColor =
-                  line.stream === 'stderr'
-                    ? 'text-red-400'
-                    : line.stream === 'command'
-                    ? 'text-[#F3F5F8] font-semibold'
-                    : line.stream === 'system'
-                    ? 'text-emerald-400'
-                    : 'text-[#D0D7E2]';
-
-                return (
-                  <div key={line.id} className="flex items-start gap-2.5 leading-relaxed break-all">
-                    <span className="text-[#5B6475] text-[11px] tabular-nums select-none shrink-0">
-                      {formatTimestampTime(line.timestamp)}
-                    </span>
-                    <span className={textColor}>{line.text}</span>
-                  </div>
-                );
-              })
-            )}
-            <div ref={terminalBottomRef} />
+          <div className="flex-1 min-h-0">
+            <TerminalOutput
+              lines={terminalLines}
+              onClear={() => setTerminalLines([])}
+              isRunning={isTerminalRunning}
+              currentCommand={currentRunningCmd}
+              serverName={server.name}
+              onNotify={notify}
+              className="h-full"
+            />
           </div>
 
-          <div className="px-4 py-2 bg-[#0B0D10] border-t border-[#181C24] flex items-center gap-1.5 overflow-x-auto text-xs font-mono">
+          <div className="px-4 py-2 bg-[#0B0D10] border-t border-[#181C24] flex items-center gap-1.5 overflow-x-auto text-xs font-mono shrink-0">
             <span className="text-[#697386] text-[11px] font-sans shrink-0 mr-1">Quick run:</span>
             {['pwd', 'ls -la', 'cat package.json', 'npm install', 'node index.js'].map((cmd) => (
               <button
@@ -1074,7 +1108,7 @@ export const ServerDetailView: React.FC<ServerDetailViewProps> = ({
               e.preventDefault();
               handleExecuteCommand();
             }}
-            className="p-2.5 bg-[#0E1014] border-t border-[#1F242D] flex items-center gap-2"
+            className="p-2.5 bg-[#0E1014] border-t border-[#1F242D] flex items-center gap-2 shrink-0"
           >
             <span className="text-emerald-400 font-mono text-xs pl-2 font-semibold select-none">
               $

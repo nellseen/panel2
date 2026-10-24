@@ -6,6 +6,10 @@ import {
   EnvInspectResult,
   EnvironmentInfo,
   FileEntry,
+  JobCategory,
+  JobModel,
+  JobOutputLine,
+  JobStatus,
   LogLine,
   PackageSpec,
   ServerModel,
@@ -225,11 +229,62 @@ export async function restartServer(
 export async function installServerDeps(
   id: string,
   options?: RequestOptions
-): Promise<{ success: boolean; output: string }> {
-  return requestJson<{ success: boolean; output: string }>(
+): Promise<{ success: boolean; jobId?: string; job?: JobModel; output: string }> {
+  return requestJson<{ success: boolean; jobId?: string; job?: JobModel; output: string }>(
     `/servers/${encodeURIComponent(id)}/install`,
     { method: 'POST' },
     { timeoutMs: LONG_OP_TIMEOUT_MS, ...options }
+  );
+}
+
+export async function fetchJobs(
+  filter?: { serverId?: string; status?: JobStatus },
+  options?: RequestOptions
+): Promise<{ jobs: JobModel[] }> {
+  const params = new URLSearchParams();
+  if (filter?.serverId) params.set('serverId', filter.serverId);
+  if (filter?.status) params.set('status', filter.status);
+  const q = params.toString() ? `?${params.toString()}` : '';
+  return requestJson<{ jobs: JobModel[] }>(`/jobs${q}`, { method: 'GET' }, options);
+}
+
+export async function fetchJob(
+  jobId: string,
+  sinceSeq?: number,
+  options?: RequestOptions
+): Promise<{ job: JobModel; lines: JobOutputLine[] }> {
+  const q = sinceSeq !== undefined ? `?sinceSeq=${sinceSeq}` : '';
+  return requestJson<{ job: JobModel; lines: JobOutputLine[] }>(
+    `/jobs/${encodeURIComponent(jobId)}${q}`,
+    { method: 'GET' },
+    options
+  );
+}
+
+export async function cancelJob(
+  jobId: string,
+  options?: RequestOptions
+): Promise<{ success: boolean; message: string }> {
+  return requestJson<{ success: boolean; message: string }>(
+    `/jobs/${encodeURIComponent(jobId)}/cancel`,
+    { method: 'POST' },
+    options
+  );
+}
+
+export async function runServerJob(
+  serverId: string,
+  command: string,
+  category: JobCategory = 'command',
+  options?: RequestOptions
+): Promise<{ success: boolean; jobId: string; job: JobModel }> {
+  return requestJson<{ success: boolean; jobId: string; job: JobModel }>(
+    `/servers/${encodeURIComponent(serverId)}/jobs/run`,
+    {
+      method: 'POST',
+      body: JSON.stringify({ command, category }),
+    },
+    options
   );
 }
 

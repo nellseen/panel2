@@ -84,6 +84,33 @@ export interface PackageSpec {
   path?: string;
 }
 
+export type JobStatus = 'queued' | 'running' | 'completed' | 'failed' | 'cancelled' | 'timed_out';
+export type JobCategory = 'install' | 'build' | 'test' | 'git' | 'command' | 'custom';
+
+export interface JobOutputLine {
+  seq: number;
+  timestamp: string;
+  stream: 'stdout' | 'stderr' | 'system' | 'command';
+  text: string;
+}
+
+export interface JobModel {
+  id: string;
+  serverId: string;
+  serverName?: string;
+  command: string;
+  category: JobCategory;
+  status: JobStatus;
+  startTime: string;
+  endTime?: string;
+  durationMs?: number;
+  exitCode: number | null;
+  signal?: string | null;
+  cwd: string;
+  output: JobOutputLine[];
+  pid?: number;
+}
+
 export interface PanelServerOptions {
   dataDir?: string;
   port?: number;
@@ -727,6 +754,18 @@ export async function createPanelServer(options: PanelServerOptions = {}): Promi
   const supervisorStates = new Map<string, SupervisorState>();
   const serverLocks = new Map<string, Promise<void>>();
   const activeTerminals = new Map<string, ActiveTerminalProcess>();
+
+  interface RunningJobRecord {
+    job: JobModel;
+    process: ChildProcess;
+    timeoutTimer?: NodeJS.Timeout;
+    intentionalKill: boolean;
+  }
+
+  const runningJobs = new Map<string, RunningJobRecord>();
+  const jobHistory: JobModel[] = [];
+  const MAX_JOB_HISTORY = 100;
+  const MAX_LINES_PER_JOB = 2000;
   const serverWorkingDirs = new Map<string, string>();
   const wsClients = new Map<WebSocket, WsClientMeta>();
   const rateBuckets = new Map<string, { count: number; resetAt: number }>();
@@ -1470,133 +1509,160 @@ export async function createPanelServer(options: PanelServerOptions = {}): Promi
     });
   }
 
-  function executeTerminalCommand(serverId: string, commandText: string): void {
-    const trimmed = commandText.trim();
-    if (!trimmed) return;
+  function startJob(params: {
+    serverId: string;
+    command: string;
+    category?: JobCategory;
+    cwd?: string;
+    timeoutMs?: number;
+  }): JobModel {
+    const { serverId, command } = params;
+    const category = params.category || 'command';
+    const timeoutMs = params.timeoutMs ?? 300_000;
 
-    let serverRoot: string;
-    try {
-      assertValidServerId(serverId);
-      serverRoot = safeResolveServerPath(serverId, '');
-    } catch {
-      return;
-    }
-
+    assertValidServerId(serverId);
     const server = store.getServer(serverId);
     if (!server) {
-      broadcastWSEvent(
-        'terminal_data',
-        {
-          serverId,
-          stream: 'system',
-          text: `[nodepanel-term] Error: Server ${serverId} not found.`,
-        },
-        serverId
-      );
-      return;
+      throw new HttpError(404, 'SERVER_NOT_FOUND', 'Server not found');
     }
 
-    fs.mkdirSync(serverRoot, { recursive: true });
-    const realServerRoot = fs.realpathSync(serverRoot);
-    const currentCwd = getServerWorkingDir(serverId);
+    const srvRoot = safeResolveServerPath(serverId, '');
+    fs.mkdirSync(srvRoot, { recursive: true });
+    const realServerRoot = fs.realpathSync(srvRoot);
+    const currentCwd = params.cwd ? safeResolveServerPath(serverId, params.cwd) : getServerWorkingDir(serverId);
     const relCwdDisplay = path.relative(realServerRoot, currentCwd) || '.';
 
-    broadcastWSEvent(
-      'terminal_data',
-      {
-        serverId,
-        stream: 'command',
-        text: `$ ${trimmed}`,
-        cwd: relCwdDisplay,
-      },
-      serverId
-    );
+    const jobId = `job-${Date.now()}-${crypto.randomBytes(3).toString('hex')}`;
+    let seqCounter = 0;
 
-    if (trimmed === 'cd' || trimmed.startsWith('cd ')) {
-      const targetArg = trimmed === 'cd' ? '' : trimmed.substring(3).trim();
+    const job: JobModel = {
+      id: jobId,
+      serverId,
+      serverName: server.name,
+      command,
+      category,
+      status: 'running',
+      startTime: new Date().toISOString(),
+      exitCode: null,
+      signal: null,
+      cwd: relCwdDisplay,
+      output: [],
+    };
+
+    const addLine = (stream: JobOutputLine['stream'], text: string) => {
+      seqCounter++;
+      const line: JobOutputLine = {
+        seq: seqCounter,
+        timestamp: new Date().toISOString(),
+        stream,
+        text,
+      };
+
+      if (job.output.length >= MAX_LINES_PER_JOB) {
+        if (job.output.length === MAX_LINES_PER_JOB) {
+          job.output.push({
+            seq: ++seqCounter,
+            timestamp: new Date().toISOString(),
+            stream: 'system',
+            text: '[nodepanel] Warning: Maximum job output buffer reached. Earlier output truncated.',
+          });
+        }
+        job.output.shift();
+      }
+      job.output.push(line);
+
+      broadcastWSEvent('job_output', { jobId, serverId, line }, serverId);
+      broadcastWSEvent('terminal_data', { serverId, stream, text, jobId, seq: line.seq }, serverId);
+      return line;
+    };
+
+    addLine('command', `$ ${command}`);
+
+    // Built-in cd command
+    if (command === 'cd' || command.startsWith('cd ')) {
+      const targetArg = command === 'cd' ? '' : command.substring(3).trim();
       const candidatePath =
         targetArg && targetArg !== '~' ? path.resolve(currentCwd, targetArg) : realServerRoot;
 
       if (candidatePath !== realServerRoot && !candidatePath.startsWith(realServerRoot + path.sep)) {
-        broadcastWSEvent(
-          'terminal_data',
-          {
-            serverId,
-            stream: 'stderr',
-            text: `cd: restricted to server workspace (${relCwdDisplay})`,
-          },
-          serverId
-        );
-        broadcastWSEvent('terminal_exit', { serverId, exitCode: 1, cwd: relCwdDisplay }, serverId);
-        return;
+        addLine('stderr', `cd: restricted to server workspace (${relCwdDisplay})`);
+        job.status = 'failed';
+        job.exitCode = 1;
+        job.endTime = new Date().toISOString();
+        job.durationMs = 5;
+        jobHistory.unshift({ ...job, output: [...job.output] });
+        broadcastWSEvent('job_finished', { jobId, serverId, exitCode: 1, durationMs: 5, status: 'failed' }, serverId);
+        broadcastWSEvent('terminal_exit', { serverId, exitCode: 1, cwd: relCwdDisplay, jobId }, serverId);
+        return job;
       }
 
       if (!fs.existsSync(candidatePath) || !fs.statSync(candidatePath).isDirectory()) {
-        broadcastWSEvent(
-          'terminal_data',
-          {
-            serverId,
-            stream: 'stderr',
-            text: `cd: no such directory: ${targetArg}`,
-          },
-          serverId
-        );
-        broadcastWSEvent('terminal_exit', { serverId, exitCode: 1, cwd: relCwdDisplay }, serverId);
-        return;
+        addLine('stderr', `cd: no such directory: ${targetArg}`);
+        job.status = 'failed';
+        job.exitCode = 1;
+        job.endTime = new Date().toISOString();
+        job.durationMs = 5;
+        jobHistory.unshift({ ...job, output: [...job.output] });
+        broadcastWSEvent('job_finished', { jobId, serverId, exitCode: 1, durationMs: 5, status: 'failed' }, serverId);
+        broadcastWSEvent('terminal_exit', { serverId, exitCode: 1, cwd: relCwdDisplay, jobId }, serverId);
+        return job;
       }
 
       const realTarget = fs.realpathSync(candidatePath);
       if (realTarget !== realServerRoot && !realTarget.startsWith(realServerRoot + path.sep)) {
-        broadcastWSEvent(
-          'terminal_data',
-          {
-            serverId,
-            stream: 'stderr',
-            text: 'cd: symbolic link outside server workspace is not permitted',
-          },
-          serverId
-        );
-        broadcastWSEvent('terminal_exit', { serverId, exitCode: 1, cwd: relCwdDisplay }, serverId);
-        return;
+        addLine('stderr', 'cd: symbolic link outside server workspace is not permitted');
+        job.status = 'failed';
+        job.exitCode = 1;
+        job.endTime = new Date().toISOString();
+        job.durationMs = 5;
+        jobHistory.unshift({ ...job, output: [...job.output] });
+        broadcastWSEvent('job_finished', { jobId, serverId, exitCode: 1, durationMs: 5, status: 'failed' }, serverId);
+        broadcastWSEvent('terminal_exit', { serverId, exitCode: 1, cwd: relCwdDisplay, jobId }, serverId);
+        return job;
       }
 
       serverWorkingDirs.set(serverId, realTarget);
       const updatedRel = path.relative(realServerRoot, realTarget) || '.';
-      broadcastWSEvent(
-        'terminal_data',
-        {
-          serverId,
-          stream: 'system',
-          text: `Directory changed to: /${updatedRel === '.' ? '' : updatedRel}`,
-        },
-        serverId
-      );
-      broadcastWSEvent('terminal_exit', { serverId, exitCode: 0, cwd: updatedRel }, serverId);
-      return;
+      job.cwd = updatedRel;
+      addLine('system', `Directory changed to: /${updatedRel === '.' ? '' : updatedRel}`);
+      job.status = 'completed';
+      job.exitCode = 0;
+      job.endTime = new Date().toISOString();
+      job.durationMs = 5;
+      jobHistory.unshift({ ...job, output: [...job.output] });
+      broadcastWSEvent('job_finished', { jobId, serverId, exitCode: 0, durationMs: 5, status: 'completed' }, serverId);
+      broadcastWSEvent('terminal_exit', { serverId, exitCode: 0, cwd: updatedRel, jobId }, serverId);
+      return job;
     }
 
-    if (trimmed === 'clear') {
+    if (command === 'clear') {
       broadcastWSEvent('terminal_clear', { serverId }, serverId);
-      broadcastWSEvent('terminal_exit', { serverId, exitCode: 0, cwd: relCwdDisplay }, serverId);
-      return;
+      job.status = 'completed';
+      job.exitCode = 0;
+      job.endTime = new Date().toISOString();
+      job.durationMs = 2;
+      jobHistory.unshift({ ...job, output: [...job.output] });
+      broadcastWSEvent('job_finished', { jobId, serverId, exitCode: 0, durationMs: 2, status: 'completed' }, serverId);
+      broadcastWSEvent('terminal_exit', { serverId, exitCode: 0, cwd: relCwdDisplay, jobId }, serverId);
+      return job;
     }
 
+    // Terminate any previous command on this server
     const existing = activeTerminals.get(serverId);
     if (existing) {
-      broadcastWSEvent(
-        'terminal_data',
-        {
-          serverId,
-          stream: 'system',
-          text: `[nodepanel-term] Terminating previous command (${existing.command})...`,
-        },
-        serverId
-      );
+      addLine('system', `[nodepanel-term] Terminating previous command (${existing.command})...`);
       killProcessTree(existing.process, 'SIGINT');
     }
 
+    // Cancel any already running jobs on this server
+    for (const [id, rj] of runningJobs.entries()) {
+      if (rj.job.serverId === serverId && rj.job.status === 'running') {
+        cancelJob(id);
+      }
+    }
+
     try {
-      const child = spawn(trimmed, {
+      const child = spawn(command, {
         shell: true,
         cwd: currentCwd,
         detached: process.platform !== 'win32',
@@ -1604,123 +1670,231 @@ export async function createPanelServer(options: PanelServerOptions = {}): Promi
           ...process.env,
           ...server.env_vars,
           PORT: String(server.port || 3400),
+          TERM: 'xterm-256color',
+          FORCE_COLOR: '1',
         },
         stdio: ['pipe', 'pipe', 'pipe'],
       });
 
+      job.pid = child.pid;
+
       const termSession: ActiveTerminalProcess = {
         process: child,
         serverId,
-        command: trimmed,
+        command,
         startTime: Date.now(),
         cwd: currentCwd,
       };
       activeTerminals.set(serverId, termSession);
 
+      const runningRecord: RunningJobRecord = {
+        job,
+        process: child,
+        intentionalKill: false,
+      };
+
+      if (timeoutMs > 0) {
+        runningRecord.timeoutTimer = setTimeout(() => {
+          if (job.status === 'running') {
+            addLine('stderr', `[nodepanel] Command timed out after ${Math.round(timeoutMs / 1000)}s`);
+            job.status = 'timed_out';
+            cancelJob(jobId);
+          }
+        }, timeoutMs);
+      }
+
+      runningJobs.set(jobId, runningRecord);
+
+      broadcastWSEvent('job_started', { job }, serverId);
       broadcastWSEvent(
         'terminal_start',
         {
           serverId,
-          command: trimmed,
+          command,
           pid: child.pid,
           cwd: relCwdDisplay,
+          jobId,
         },
         serverId
       );
 
-      child.stdout?.on('data', (chunk: Buffer) => {
-        const lines = chunk.toString('utf-8').split('\n');
-        for (const line of lines) {
-          if (line.length > 0) {
-            broadcastWSEvent('terminal_data', { serverId, stream: 'stdout', text: line }, serverId);
+      const handleChunk = (stream: 'stdout' | 'stderr', chunk: Buffer) => {
+        const raw = chunk.toString('utf-8');
+        const lines = raw.split(/\r?\n/);
+        for (const l of lines) {
+          if (l.includes('\r')) {
+            const parts = l.split('\r');
+            const lastPart = parts[parts.length - 1];
+            if (lastPart.length > 0) {
+              addLine(stream, lastPart);
+            }
+          } else if (l.length > 0) {
+            addLine(stream, l);
           }
         }
-      });
+      };
 
-      child.stderr?.on('data', (chunk: Buffer) => {
-        const lines = chunk.toString('utf-8').split('\n');
-        for (const line of lines) {
-          if (line.length > 0) {
-            broadcastWSEvent('terminal_data', { serverId, stream: 'stderr', text: line }, serverId);
-          }
-        }
-      });
+      child.stdout?.on('data', (chunk: Buffer) => handleChunk('stdout', chunk));
+      child.stderr?.on('data', (chunk: Buffer) => handleChunk('stderr', chunk));
 
       child.on('error', (err) => {
-        broadcastWSEvent(
-          'terminal_data',
-          {
-            serverId,
-            stream: 'stderr',
-            text: `[nodepanel-term] Spawn error: ${err.message}`,
-          },
-          serverId
-        );
+        addLine('stderr', `[nodepanel-term] Spawn error: ${err.message}`);
       });
 
       child.on('exit', (code, signal) => {
+        if (runningRecord.timeoutTimer) {
+          clearTimeout(runningRecord.timeoutTimer);
+        }
+        runningJobs.delete(jobId);
         if (activeTerminals.get(serverId) === termSession) {
           activeTerminals.delete(serverId);
         }
-        const exitCode = code !== null ? code : signal ? 130 : 0;
-        const durationMs = Date.now() - termSession.startTime;
+
+        const durationMs = Date.now() - new Date(job.startTime).getTime();
+        job.durationMs = durationMs;
+        job.endTime = new Date().toISOString();
+        job.signal = signal;
+
+        if (runningRecord.intentionalKill) {
+          job.status = 'cancelled';
+          job.exitCode = code !== null ? code : 130;
+          addLine('system', `[process cancelled by user (${job.exitCode}) in ${(durationMs / 1000).toFixed(1)}s]`);
+        } else if (job.status === 'timed_out') {
+          job.exitCode = 124;
+          addLine('system', `[process timed out after ${(durationMs / 1000).toFixed(1)}s]`);
+        } else if (code === 0) {
+          job.status = 'completed';
+          job.exitCode = 0;
+          addLine('system', `[process exited with code 0 in ${(durationMs / 1000).toFixed(1)}s]`);
+        } else {
+          job.status = 'failed';
+          job.exitCode = code !== null ? code : 1;
+          addLine(
+            'system',
+            `[process exited with code ${job.exitCode}${signal ? ` (${signal})` : ''} in ${(durationMs / 1000).toFixed(1)}s]`
+          );
+        }
+
+        jobHistory.unshift({ ...job, output: [...job.output] });
+        if (jobHistory.length > MAX_JOB_HISTORY) {
+          jobHistory.pop();
+        }
+
         broadcastWSEvent(
-          'terminal_data',
+          'job_finished',
           {
+            jobId,
             serverId,
-            stream: 'system',
-            text: `[process exited with code ${exitCode}${signal ? ` (${signal})` : ''} in ${(durationMs / 1000).toFixed(1)}s]`,
+            exitCode: job.exitCode,
+            signal,
+            durationMs,
+            status: job.status,
           },
           serverId
         );
+
         broadcastWSEvent(
           'terminal_exit',
           {
             serverId,
-            exitCode,
+            exitCode: job.exitCode,
             signal,
             cwd: relCwdDisplay,
+            jobId,
           },
           serverId
         );
       });
+
+      return job;
     } catch (err: unknown) {
       const msg = err instanceof Error ? err.message : 'Unknown spawn error';
+      addLine('stderr', `[nodepanel-term] Failed to start command: ${msg}`);
+      job.status = 'failed';
+      job.exitCode = 1;
+      job.endTime = new Date().toISOString();
+      job.durationMs = 5;
+      jobHistory.unshift({ ...job, output: [...job.output] });
+      broadcastWSEvent('job_finished', { jobId, serverId, exitCode: 1, durationMs: 5, status: 'failed' }, serverId);
+      broadcastWSEvent('terminal_exit', { serverId, exitCode: 1, cwd: relCwdDisplay, jobId }, serverId);
+      return job;
+    }
+  }
+
+  function cancelJob(jobId: string): boolean {
+    const rj = runningJobs.get(jobId);
+    if (!rj) return false;
+    rj.intentionalKill = true;
+    killProcessTree(rj.process, 'SIGINT');
+    const timer = setTimeout(() => {
+      if (runningJobs.has(jobId)) {
+        killProcessTree(rj.process, 'SIGKILL');
+      }
+    }, 1800);
+    timer.unref?.();
+    return true;
+  }
+
+  function getJob(jobId: string, sinceSeq?: number): { job: JobModel; lines: JobOutputLine[] } | null {
+    const rj = runningJobs.get(jobId);
+    const found = rj ? rj.job : jobHistory.find((j) => j.id === jobId);
+    if (!found) return null;
+    const since = typeof sinceSeq === 'number' ? sinceSeq : 0;
+    const lines = found.output ? found.output.filter((l) => l.seq > since) : [];
+    return { job: found, lines };
+  }
+
+  function listJobs(serverId?: string, status?: JobStatus): JobModel[] {
+    const all: JobModel[] = [];
+    for (const rj of runningJobs.values()) {
+      if ((!serverId || rj.job.serverId === serverId) && (!status || rj.job.status === status)) {
+        all.push(rj.job);
+      }
+    }
+    for (const h of jobHistory) {
+      if ((!serverId || h.serverId === serverId) && (!status || h.status === status)) {
+        if (!all.some((j) => j.id === h.id)) {
+          all.push(h);
+        }
+      }
+    }
+    return all;
+  }
+
+  function executeTerminalCommand(serverId: string, commandText: string): JobModel | undefined {
+    const trimmed = commandText.trim();
+    if (!trimmed) return undefined;
+    return startJob({ serverId, command: trimmed, category: 'command' });
+  }
+
+  function killTerminalCommand(serverId: string): void {
+    let killed = false;
+    for (const [jobId, rj] of runningJobs.entries()) {
+      if (rj.job.serverId === serverId && rj.job.status === 'running') {
+        cancelJob(jobId);
+        killed = true;
+      }
+    }
+
+    const session = activeTerminals.get(serverId);
+    if (session && !killed) {
       broadcastWSEvent(
         'terminal_data',
         {
           serverId,
-          stream: 'stderr',
-          text: `[nodepanel-term] Failed to start command: ${msg}`,
+          stream: 'system',
+          text: '^C [nodepanel-term] Sending SIGINT to process group...',
         },
         serverId
       );
-      broadcastWSEvent('terminal_exit', { serverId, exitCode: 1, cwd: relCwdDisplay }, serverId);
+      killProcessTree(session.process, 'SIGINT');
+      const killTimer = setTimeout(() => {
+        if (activeTerminals.get(serverId) === session) {
+          killProcessTree(session.process, 'SIGKILL');
+        }
+      }, 1500);
+      killTimer.unref?.();
     }
-  }
-
-  function killTerminalCommand(serverId: string): void {
-    const session = activeTerminals.get(serverId);
-    if (!session) return;
-
-    broadcastWSEvent(
-      'terminal_data',
-      {
-        serverId,
-        stream: 'system',
-        text: '^C [nodepanel-term] Sending SIGINT to process group...',
-      },
-      serverId
-    );
-
-    killProcessTree(session.process, 'SIGINT');
-
-    const killTimer = setTimeout(() => {
-      if (activeTerminals.get(serverId) === session) {
-        killProcessTree(session.process, 'SIGKILL');
-      }
-    }, 1500);
-    killTimer.unref?.();
   }
 
   function findAvailablePort(startPort = 3001): number {
@@ -2497,31 +2671,48 @@ export async function createPanelServer(options: PanelServerOptions = {}): Promi
         return res.status(404).json({ error: true, code: 'SERVER_NOT_FOUND', message: 'Server not found' });
       }
 
-      const srvDir = safeResolveServerPath(id, '');
-      const result = await withServerLock(id, async () => {
-        const wasRunning = activeProcesses.has(id);
-        if (!wasRunning) {
-          updateServerStatus(id, 'installing', 0);
-        }
-        try {
-          const resOut = await runCommandAsync('npm', ['install', '--no-audit', '--no-fund'], {
-            cwd: srvDir,
-            timeoutMs: 300_000,
+      // Prevent concurrent npm install on the same server
+      for (const rj of runningJobs.values()) {
+        if (rj.job.serverId === id && rj.job.category === 'install' && rj.job.status === 'running') {
+          return res.status(409).json({
+            error: true,
+            code: 'INSTALL_IN_PROGRESS',
+            message: 'Dependency installation is already running on this server',
+            jobId: rj.job.id,
           });
-          if (!activeProcesses.has(id)) {
-            updateServerStatus(id, 'stopped', 0);
-          }
-          store.recordActivity('npm_install', id, `Installed npm dependencies for '${srv.name}'`, 'success');
-          return resOut;
-        } catch (installErr: unknown) {
-          if (!activeProcesses.has(id)) {
-            updateServerStatus(id, 'stopped', 1);
-          }
-          throw installErr;
         }
+      }
+
+      const job = startJob({
+        serverId: id,
+        command: 'npm install --no-audit --no-fund',
+        category: 'install',
+        timeoutMs: 300_000,
       });
 
-      return res.json({ success: true, output: result.output });
+      store.recordActivity('npm_install', id, `Started npm install job for '${srv.name}'`, 'success');
+
+      if (req.query.wait === 'true') {
+        await new Promise<void>((resolve) => {
+          const check = setInterval(() => {
+            const current = getJob(job.id);
+            if (!current || current.job.status !== 'running') {
+              clearInterval(check);
+              resolve();
+            }
+          }, 150);
+        });
+        const finished = getJob(job.id);
+        const out = finished?.lines.map((l) => l.text).join('\n') || '';
+        return res.json({ success: finished?.job.status === 'completed', jobId: job.id, output: out });
+      }
+
+      return res.status(202).json({
+        success: true,
+        jobId: job.id,
+        job,
+        output: 'npm install started',
+      });
     } catch (err) {
       next(err);
     }
@@ -2791,10 +2982,19 @@ API_SECRET_KEY=
       const cwd = getServerWorkingDir(id);
       const rel = path.relative(root, cwd) || '.';
 
+      let activeJobId: string | undefined;
+      for (const [jid, rj] of runningJobs.entries()) {
+        if (rj.job.serverId === id && rj.job.status === 'running') {
+          activeJobId = jid;
+          break;
+        }
+      }
+
       return res.json({
         isRunning: Boolean(active),
         currentCommand: active ? active.command : '',
         cwd: rel,
+        activeJobId,
       });
     } catch (err) {
       next(err);
@@ -2809,8 +3009,8 @@ API_SECRET_KEY=
       if (!command) {
         return res.status(400).json({ error: true, code: 'MISSING_COMMAND', message: 'command is required' });
       }
-      executeTerminalCommand(id, command);
-      return res.json({ success: true });
+      const job = executeTerminalCommand(id, command);
+      return res.json({ success: true, jobId: job?.id });
     } catch (err) {
       next(err);
     }
@@ -2822,6 +3022,69 @@ API_SECRET_KEY=
       assertValidServerId(id);
       killTerminalCommand(id);
       return res.json({ success: true });
+    } catch (err) {
+      next(err);
+    }
+  });
+
+  // --- Background Jobs REST Endpoints ---
+  app.get('/api/jobs', (req: Request, res: Response) => {
+    const serverId = typeof req.query.serverId === 'string' ? req.query.serverId : undefined;
+    const status = typeof req.query.status === 'string' ? (req.query.status as JobStatus) : undefined;
+    const jobs = listJobs(serverId, status);
+    return res.json({
+      jobs: jobs.map((j) => ({
+        id: j.id,
+        serverId: j.serverId,
+        serverName: j.serverName,
+        command: j.command,
+        category: j.category,
+        status: j.status,
+        startTime: j.startTime,
+        endTime: j.endTime,
+        durationMs: j.durationMs,
+        exitCode: j.exitCode,
+        signal: j.signal,
+        cwd: j.cwd,
+        lineCount: j.output.length,
+        lastLine: j.output[j.output.length - 1]?.text ?? '',
+      })),
+    });
+  });
+
+  app.get('/api/jobs/:jobId', (req: Request, res: Response) => {
+    const jobId = String(req.params.jobId);
+    const sinceSeq = req.query.sinceSeq ? Number(req.query.sinceSeq) : undefined;
+    const result = getJob(jobId, sinceSeq);
+    if (!result) {
+      return res.status(404).json({ error: true, code: 'JOB_NOT_FOUND', message: 'Job not found' });
+    }
+    return res.json({
+      job: result.job,
+      lines: result.lines,
+    });
+  });
+
+  app.post('/api/jobs/:jobId/cancel', (req: Request, res: Response) => {
+    const jobId = String(req.params.jobId);
+    const cancelled = cancelJob(jobId);
+    if (!cancelled) {
+      return res.status(404).json({ error: true, code: 'JOB_NOT_RUNNING', message: 'Job not found or already stopped' });
+    }
+    return res.json({ success: true, message: 'Job cancelled' });
+  });
+
+  app.post('/api/servers/:id/jobs/run', (req: Request, res: Response, next: NextFunction) => {
+    try {
+      const id = String(req.params.id);
+      assertValidServerId(id);
+      const command = typeof req.body?.command === 'string' ? req.body.command.trim() : '';
+      if (!command) {
+        return res.status(400).json({ error: true, code: 'MISSING_COMMAND', message: 'command is required' });
+      }
+      const category = (req.body?.category as JobCategory) || 'command';
+      const job = startJob({ serverId: id, command, category });
+      return res.status(202).json({ success: true, jobId: job.id, job });
     } catch (err) {
       next(err);
     }
@@ -3167,6 +3430,13 @@ API_SECRET_KEY=
             const cwd = getServerWorkingDir(payload.serverId);
             const rel = path.relative(root, cwd) || '.';
             const activeTerm = activeTerminals.get(payload.serverId);
+            let activeJob: JobModel | undefined;
+            for (const rj of runningJobs.values()) {
+              if (rj.job.serverId === payload.serverId && rj.job.status === 'running') {
+                activeJob = rj.job;
+                break;
+              }
+            }
 
             ws.send(
               JSON.stringify({
@@ -3174,8 +3444,10 @@ API_SECRET_KEY=
                 data: {
                   serverId: payload.serverId,
                   cwd: rel,
-                  isRunning: Boolean(activeTerm),
-                  currentCommand: activeTerm ? activeTerm.command : '',
+                  isRunning: Boolean(activeTerm || activeJob),
+                  currentCommand: activeTerm ? activeTerm.command : activeJob ? activeJob.command : '',
+                  activeJobId: activeJob ? activeJob.id : undefined,
+                  job: activeJob,
                 },
               })
             );
@@ -3243,6 +3515,7 @@ API_SECRET_KEY=
     const vite = await createViteServer({
       server: {
         middlewareMode: true,
+        allowedHosts: true,
         hmr: process.env.DISABLE_HMR === 'true' ? false : { server },
         watch: {
           ignored: [
@@ -3308,6 +3581,11 @@ API_SECRET_KEY=
       killProcessTree(term.process, 'SIGKILL');
     }
     activeTerminals.clear();
+
+    for (const [, rj] of runningJobs.entries()) {
+      killProcessTree(rj.process, 'SIGKILL');
+    }
+    runningJobs.clear();
 
     for (const [ws] of wsClients.entries()) {
       try {
