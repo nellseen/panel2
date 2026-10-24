@@ -9,7 +9,7 @@ import { DiagnosticsView } from './components/DiagnosticsView';
 import { ActivityLogsView } from './components/ActivityLogsView';
 import { SettingsView } from './components/SettingsView';
 import { CreateServerModal } from './components/CreateServerModal';
-import { MobileBottomNav } from './components/MobileBottomNav';
+import { FloatingNavBar } from './components/FloatingNavBar';
 
 import {
   ServerModel,
@@ -174,7 +174,7 @@ export default function App() {
   };
 
   return (
-    <div className="min-h-screen bg-slate-950 text-slate-100 flex justify-center font-sans antialiased relative overflow-x-hidden selection:bg-emerald-500/30 selection:text-emerald-300">
+    <div className="h-[100dvh] max-h-[100dvh] overflow-hidden bg-slate-950 text-slate-100 flex justify-center font-sans antialiased relative selection:bg-emerald-500/30 selection:text-emerald-300">
       {/* Ambient Mobile Glow */}
       <div className="fixed inset-0 pointer-events-none overflow-hidden z-0">
         <div className="absolute -top-[10%] left-1/2 -translate-x-1/2 w-96 h-96 rounded-full bg-emerald-500/[0.07] blur-[100px]" />
@@ -182,7 +182,7 @@ export default function App() {
       </div>
 
       {/* Strict Mobile Canvas Container (Tailored for Mobile Phone Viewport) */}
-      <div className="w-full max-w-md mx-auto min-h-screen flex flex-col bg-slate-950/90 backdrop-blur-xl border-x border-white/[0.08] shadow-[0_0_50px_rgba(0,0,0,0.8)] relative">
+      <div className="w-full max-w-md mx-auto h-[100dvh] max-h-[100dvh] flex flex-col bg-slate-950/90 backdrop-blur-xl border-x border-white/[0.08] shadow-[0_0_50px_rgba(0,0,0,0.8)] relative overflow-hidden">
         {/* Toast Notification */}
         {toast && (
           <div className="fixed top-16 inset-x-0 max-w-sm mx-auto px-4 z-50 animate-in fade-in slide-in-from-top-2 duration-200">
@@ -198,7 +198,7 @@ export default function App() {
           </div>
         )}
 
-        {/* Top Navbar */}
+        {/* Top Navbar - Fixed Anchor */}
         <Navbar
           runtime={runtime}
           wsConnected={wsConnected}
@@ -212,8 +212,8 @@ export default function App() {
           currentFeatureName={getCurrentFeatureName()}
         />
 
-        {/* Mobile Viewport Main Body (with safe bottom padding for MobileBottomNav) */}
-        <main className="flex-1 px-3 py-3.5 pb-20 overflow-y-auto">
+        {/* Mobile Viewport Main Body (with safe bottom padding for FloatingNavBar) */}
+        <main className="flex-1 px-3 py-3.5 pb-28 overflow-y-auto overscroll-y-contain">
           {activeServerId ? (
             <ServerDetailView
               serverId={activeServerId}
@@ -272,8 +272,8 @@ export default function App() {
           )}
         </main>
 
-        {/* Mobile Bottom Navigation Bar (Docked) */}
-        <MobileBottomNav
+        {/* Custom Floating Navigation Bar */}
+        <FloatingNavBar
           currentTab={currentTab}
           onSelectTab={(tab) => {
             setActiveServerId(null);
@@ -282,6 +282,7 @@ export default function App() {
           servers={servers}
           activeServerId={activeServerId}
           onClearActiveServer={() => setActiveServerId(null)}
+          onOpenCreate={() => setIsCreateModalOpen(true)}
         />
       </div>
 

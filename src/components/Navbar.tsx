@@ -22,7 +22,7 @@ export const Navbar: React.FC<NavbarProps> = ({
   onOpenDiagnostics,
 }) => {
   return (
-    <header className="h-14 glass-panel glass-specular border-b border-white/[0.08] px-3.5 flex items-center justify-between sticky top-0 z-30 w-full">
+    <header className="h-14 glass-panel glass-specular border-b border-white/[0.08] px-3.5 flex items-center justify-between sticky top-0 z-30 w-full shrink-0">
       {/* Brand & Runtime Chip */}
       <div className="flex items-center gap-2 truncate">
         <div className="h-8 w-8 rounded-xl bg-gradient-to-br from-emerald-400 via-teal-500 to-cyan-600 flex items-center justify-center shadow-[0_0_12px_rgba(16,185,129,0.3)] border border-white/20 shrink-0">
