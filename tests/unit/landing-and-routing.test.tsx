@@ -171,6 +171,22 @@ describe('Landing Page & Routing Unit Verification', () => {
       expect(screen.getByText(/NodePanel Supervisor Daemon/i)).toBeInTheDocument();
       expect(screen.getByText(/killProcessTree\(child, SIGTERM\)/i)).toBeInTheDocument();
     });
+
+    it('renders the top announcement banner and platform showcase banner, and top banner can be dismissed', async () => {
+      const user = userEvent.setup();
+      render(<LandingPageView onStartNow={vi.fn()} />);
+
+      // Announcement banner is visible initially
+      expect(screen.getByText(/NodePanel v1\.0 Siap Digunakan/i)).toBeInTheDocument();
+      expect(screen.getByText(/Termux & Proot Native/i)).toBeInTheDocument();
+      expect(screen.getAllByText(/Zero Zombie Processes/i).length).toBeGreaterThanOrEqual(1);
+
+      // Dismiss top announcement banner
+      const dismissBtn = screen.getByRole('button', { name: /Tutup pengumuman/i });
+      await user.click(dismissBtn);
+
+      expect(screen.queryByText(/NodePanel v1\.0 Siap Digunakan/i)).not.toBeInTheDocument();
+    });
   });
 
   describe('Full Application Flow with Root Landing Page & Routing', () => {

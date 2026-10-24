@@ -14,6 +14,7 @@ import {
   Server,
   Shield,
   ShieldCheck,
+  Sparkles,
   Stethoscope,
   Terminal,
   X,
@@ -27,6 +28,7 @@ export interface LandingPageViewProps {
 }
 
 export const LandingPageView: React.FC<LandingPageViewProps> = ({ onStartNow }) => {
+  const [showTopBanner, setShowTopBanner] = useState(true);
   const [mobileMenuOpen, setMobileMenuOpen] = useState(false);
   const [previewTab, setPreviewTab] = useState<'logs' | 'metrics' | 'topology'>('logs');
   const [copiedInstallCmd, setCopiedInstallCmd] = useState(false);
@@ -52,6 +54,50 @@ export const LandingPageView: React.FC<LandingPageViewProps> = ({ onStartNow }) 
 
   return (
     <div className="min-h-screen bg-[#08090B] text-[#F3F5F8] font-sans antialiased selection:bg-emerald-500/25 selection:text-emerald-200">
+      {/* =========================================================================
+          Top Announcement Banner (Dismissible)
+          ========================================================================= */}
+      {showTopBanner && (
+        <div
+          role="region"
+          aria-label="Pengumuman rilis NodePanel"
+          className="bg-gradient-to-r from-[#0C1210] via-[#102219] to-[#0C1210] border-b border-emerald-500/25 px-4 py-2 text-xs text-[#D0D7E2] relative z-50 animate-in fade-in duration-200"
+        >
+          <div className="max-w-7xl mx-auto flex items-center justify-between gap-3">
+            <div className="flex-1 flex items-center justify-center gap-2 text-center flex-wrap">
+              <span className="font-semibold text-emerald-400 inline-flex items-center gap-1.5 shrink-0">
+                <Sparkles className="w-3.5 h-3.5 text-emerald-400" aria-hidden="true" />
+                <span>NodePanel v1.0 Siap Digunakan</span>
+              </span>
+              <span className="text-[#323A48] hidden sm:inline" aria-hidden="true">
+                ·
+              </span>
+              <span className="text-[#A2AAB8]">
+                Panel proses Node.js super ringan untuk mobile Linux Termux dan server
+              </span>
+              <button
+                type="button"
+                onClick={onStartNow}
+                className="text-emerald-400 hover:text-emerald-300 font-medium inline-flex items-center gap-1 underline underline-offset-2 transition-colors cursor-pointer"
+              >
+                <span>Buka Dashboard</span>
+                <ArrowRight className="w-3 h-3" />
+              </button>
+            </div>
+
+            <button
+              type="button"
+              onClick={() => setShowTopBanner(false)}
+              aria-label="Tutup pengumuman"
+              title="Tutup banner"
+              className="text-[#697386] hover:text-[#F3F5F8] p-1 rounded transition-colors cursor-pointer shrink-0"
+            >
+              <X className="w-3.5 h-3.5" />
+            </button>
+          </div>
+        </div>
+      )}
+
       {/* =========================================================================
           Top Bar Contract: [Brand Wordmark] — [Nav Links] — [Primary Action]
           ========================================================================= */}
@@ -427,6 +473,58 @@ export const LandingPageView: React.FC<LandingPageViewProps> = ({ onStartNow }) 
                     Buka Console
                   </Button>
                 </div>
+              </div>
+            </div>
+          </div>
+        </div>
+      </section>
+
+      {/* =========================================================================
+          PLATFORM CAPABILITY SHOWCASE BANNER
+          ========================================================================= */}
+      <section
+        aria-label="Platform Highlights"
+        className="border-b border-[#14171D] bg-[#0A0C0F] py-6 relative"
+      >
+        <div className="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8">
+          <div className="grid grid-cols-2 lg:grid-cols-4 gap-4 sm:gap-6 text-xs text-[#A2AAB8]">
+            <div className="flex items-center gap-3 p-3.5 bg-[#0E1014] rounded-xl border border-[#1A1F29] hover:border-emerald-500/25 transition-colors">
+              <div className="h-9 w-9 rounded-lg bg-[#14171D] border border-[#242A35] flex items-center justify-center shrink-0 text-emerald-400">
+                <Terminal className="w-4 h-4" />
+              </div>
+              <div className="min-w-0">
+                <div className="font-semibold text-[#F3F5F8] truncate">Termux & Proot Native</div>
+                <div className="text-[11px] text-[#697386] truncate">Android Linux ready</div>
+              </div>
+            </div>
+
+            <div className="flex items-center gap-3 p-3.5 bg-[#0E1014] rounded-xl border border-[#1A1F29] hover:border-emerald-500/25 transition-colors">
+              <div className="h-9 w-9 rounded-lg bg-[#14171D] border border-[#242A35] flex items-center justify-center shrink-0 text-emerald-400">
+                <ShieldCheck className="w-4 h-4" />
+              </div>
+              <div className="min-w-0">
+                <div className="font-semibold text-[#F3F5F8] truncate">Zero Zombie Processes</div>
+                <div className="text-[11px] text-[#697386] truncate">Clean process-tree kill</div>
+              </div>
+            </div>
+
+            <div className="flex items-center gap-3 p-3.5 bg-[#0E1014] rounded-xl border border-[#1A1F29] hover:border-emerald-500/25 transition-colors">
+              <div className="h-9 w-9 rounded-lg bg-[#14171D] border border-[#242A35] flex items-center justify-center shrink-0 text-emerald-400">
+                <HardDrive className="w-4 h-4" />
+              </div>
+              <div className="min-w-0">
+                <div className="font-semibold text-[#F3F5F8] truncate">Atomic JSON Storage</div>
+                <div className="text-[11px] text-[#697386] truncate">No external DB required</div>
+              </div>
+            </div>
+
+            <div className="flex items-center gap-3 p-3.5 bg-[#0E1014] rounded-xl border border-[#1A1F29] hover:border-emerald-500/25 transition-colors">
+              <div className="h-9 w-9 rounded-lg bg-[#14171D] border border-[#242A35] flex items-center justify-center shrink-0 text-emerald-400">
+                <Zap className="w-4 h-4" />
+              </div>
+              <div className="min-w-0">
+                <div className="font-semibold text-[#F3F5F8] truncate">Duplex WebSocket</div>
+                <div className="text-[11px] text-[#697386] truncate">Live logs & telemetry</div>
               </div>
             </div>
           </div>
