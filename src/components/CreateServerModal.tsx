@@ -94,8 +94,8 @@ export const CreateServerModal: React.FC<CreateServerModalProps> = ({
   };
 
   return (
-    <div className="fixed inset-0 z-50 bg-black/70 backdrop-blur-md flex items-center justify-center p-4 overflow-y-auto">
-      <div className="glass-panel glass-specular rounded-2xl max-w-xl w-full p-6 shadow-2xl relative my-8 border border-white/20">
+    <div className="fixed inset-0 z-50 bg-black/70 backdrop-blur-md flex items-center justify-center p-3 sm:p-4 overflow-y-auto">
+      <div className="glass-panel glass-specular rounded-2xl max-w-md w-full p-5 sm:p-6 shadow-2xl relative my-auto max-h-[92vh] overflow-y-auto border border-white/20">
         {/* Close Button */}
         <button
           onClick={onClose}

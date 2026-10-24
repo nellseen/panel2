@@ -170,6 +170,10 @@ export const ServerDetailView: React.FC<ServerDetailViewProps> = ({
   // Quick npm install in header
   const [isInstallingDeps, setIsInstallingDeps] = useState(false);
 
+  // Deduplication & single-initial-seed refs to prevent "auto relog" loops
+  const seenLogHashesRef = useRef<Set<string>>(new Set());
+  const initialLogsSeededRef = useRef(false);
+
   // Load Main Server Data
   const loadData = async () => {
     try {
@@ -184,16 +188,23 @@ export const ServerDetailView: React.FC<ServerDetailViewProps> = ({
 
       const logs = await fetchServerLogs(serverId);
       setAppLogs(logs || []);
-      if (logs && logs.length > 0) {
-        setTerminalLines((prev) => [
-          ...prev,
-          ...logs.map((l, i) => ({
-            id: `past-${i}-${Date.now()}`,
+
+      // Only seed initial logs into terminal lines ONCE on mount
+      if (!initialLogsSeededRef.current && logs && logs.length > 0) {
+        initialLogsSeededRef.current = true;
+        const newLines: TerminalLine[] = [];
+        for (let i = 0; i < logs.length; i++) {
+          const l = logs[i];
+          const hash = `${l.timestamp}_${l.text}`;
+          seenLogHashesRef.current.add(hash);
+          newLines.push({
+            id: `past-${i}-${hash}`,
             timestamp: l.timestamp,
             stream: l.stream as any,
             text: l.text,
-          })),
-        ]);
+          });
+        }
+        setTerminalLines((prev) => [...prev, ...newLines]);
       }
     } catch (err: any) {
       setError(err.message || 'Failed to load server');
@@ -206,19 +217,28 @@ export const ServerDetailView: React.FC<ServerDetailViewProps> = ({
     loadData();
     wsClient.subscribeServer(serverId);
 
-    // Main App Logs from Server Daemon
+    // Main App Logs from Server Daemon (strictly deduplicated)
     const unsubLog = wsClient.on('log', (payload: any) => {
       if (payload.server_id === serverId) {
+        const text = payload.text || '';
+        const timestamp = payload.timestamp || new Date().toISOString();
+        const hash = `${timestamp}_${text}`;
+
+        if (seenLogHashesRef.current.has(hash)) {
+          return;
+        }
+        seenLogHashesRef.current.add(hash);
+
         const newLine: LogLine = {
-          timestamp: payload.timestamp || new Date().toISOString(),
+          timestamp,
           stream: payload.stream || 'stdout',
-          text: payload.text || '',
+          text,
         };
         setAppLogs((prev) => [...prev, newLine]);
         setTerminalLines((prev) => [
           ...prev,
           {
-            id: Date.now().toString() + Math.random().toString(36).substring(2, 5),
+            id: `live-${Date.now()}-${Math.random().toString(36).substring(2, 6)}`,
             timestamp: newLine.timestamp,
             stream: newLine.stream,
             text: newLine.text,
@@ -528,7 +548,8 @@ export const ServerDetailView: React.FC<ServerDetailViewProps> = ({
       const descMap: Record<string, string> = {};
 
       for (const v of res.variables) {
-        valMap[v.key] = v.value;
+        // Pre-fill with existing value, or default to example_value from template so user doesn't have to type it manually!
+        valMap[v.key] = v.value !== '' ? v.value : (v.example_value || '');
         if (v.comment) descMap[v.key] = v.comment;
       }
       setEnvValues(valMap);
@@ -540,11 +561,46 @@ export const ServerDetailView: React.FC<ServerDetailViewProps> = ({
     }
   };
 
+  const handleApplyAllTemplates = () => {
+    if (!envData) return;
+    const updated = { ...envValues };
+    let count = 0;
+    for (const v of envData.variables) {
+      if (v.example_value !== undefined && v.example_value !== '') {
+        updated[v.key] = v.example_value;
+        count++;
+      }
+    }
+    setEnvValues(updated);
+    showToast(`Berhasil mengisi ${count} nilai dari template .env.example`, 'success');
+  };
+
+  const handleApplyAndSaveTemplate = async () => {
+    if (!envData) return;
+    const updated = { ...envValues };
+    for (const v of envData.variables) {
+      if (v.example_value !== undefined && v.example_value !== '') {
+        updated[v.key] = v.example_value;
+      }
+    }
+    setEnvValues(updated);
+    try {
+      setIsSavingEnv(true);
+      const res = await saveServerEnv(serverId, updated);
+      showToast(`Berhasil menerapkan & menyimpan ${res.count} nilai template ke .env!`, 'success');
+      await loadEnvironment();
+    } catch (err: any) {
+      showToast('Gagal menyimpan ke .env: ' + err.message, 'error');
+    } finally {
+      setIsSavingEnv(false);
+    }
+  };
+
   const handleSaveEnvironment = async () => {
     try {
       setIsSavingEnv(true);
       const res = await saveServerEnv(serverId, envValues);
-      showToast(`Saved ${res.count} environment variables to .env`, 'success');
+      showToast(`Berhasil menyimpan ${res.count} environment variables ke .env`, 'success');
       await loadEnvironment();
     } catch (err: any) {
       showToast('Failed to save .env: ' + err.message, 'error');
@@ -1381,13 +1437,36 @@ export const ServerDetailView: React.FC<ServerDetailViewProps> = ({
               </p>
             </div>
 
-            <div className="flex items-center gap-2">
+            <div className="flex items-center gap-2 flex-wrap">
+              {envData?.has_example && (
+                <>
+                  <button
+                    onClick={handleApplyAllTemplates}
+                    className="flex items-center gap-1.5 px-3 py-1.5 text-xs text-cyan-300 hover:text-white bg-cyan-500/15 hover:bg-cyan-500/25 border border-cyan-500/30 rounded-xl transition-all font-medium"
+                    title="Isi otomatis semua field yang kosong dari template .env.example"
+                  >
+                    <Sparkles className="w-3.5 h-3.5" />
+                    <span>Isi dari Template</span>
+                  </button>
+
+                  <button
+                    onClick={handleApplyAndSaveTemplate}
+                    disabled={isSavingEnv}
+                    className="flex items-center gap-1.5 px-3 py-1.5 text-xs text-amber-300 hover:text-white bg-amber-500/15 hover:bg-amber-500/25 border border-amber-500/30 rounded-xl transition-all font-semibold disabled:opacity-50"
+                    title="Terapkan semua nilai dari .env.example dan langsung simpan ke .env"
+                  >
+                    <Sparkles className="w-3.5 h-3.5" />
+                    <span>Terapkan & Simpan ke .env</span>
+                  </button>
+                </>
+              )}
+
               <button
                 onClick={() => setRevealSecrets(!revealSecrets)}
                 className="flex items-center gap-1.5 px-3 py-1.5 text-xs text-slate-300 hover:text-white bg-white/[0.04] border border-white/[0.08] rounded-xl"
               >
                 {revealSecrets ? <EyeOff className="w-3.5 h-3.5" /> : <Eye className="w-3.5 h-3.5" />}
-                <span>{revealSecrets ? 'Hide Values' : 'Reveal Values'}</span>
+                <span>{revealSecrets ? 'Sembunyikan' : 'Tampilkan'}</span>
               </button>
 
               <button
@@ -1396,22 +1475,39 @@ export const ServerDetailView: React.FC<ServerDetailViewProps> = ({
                 className="flex items-center gap-1.5 px-4 py-1.5 bg-emerald-500 hover:bg-emerald-400 text-slate-950 font-bold text-xs rounded-xl shadow-md transition-colors disabled:opacity-50"
               >
                 <Save className="w-3.5 h-3.5" />
-                <span>{isSavingEnv ? 'Saving to .env...' : 'Save to .env'}</span>
+                <span>{isSavingEnv ? 'Menyimpan...' : 'Simpan ke .env'}</span>
               </button>
             </div>
           </div>
+
+          {/* Banner if .env file is not yet saved but template is ready */}
+          {!envData?.has_env && envData?.has_example && (
+            <div className="bg-emerald-500/10 border border-emerald-500/30 p-3 rounded-xl flex items-center justify-between gap-3 text-xs">
+              <div className="text-emerald-200 flex items-center gap-2">
+                <Sparkles className="w-4 h-4 text-emerald-400 shrink-0" />
+                <span>Template terdeteksi. Nilai default telah diisi otomatis. Tekan <strong>Simpan ke .env</strong> untuk mengaktifkan konfigurasi.</span>
+              </div>
+              <button
+                onClick={handleApplyAndSaveTemplate}
+                disabled={isSavingEnv}
+                className="px-3 py-1 bg-emerald-500 text-slate-950 font-bold text-xs rounded-lg shrink-0 hover:bg-emerald-400 transition-colors shadow"
+              >
+                Simpan ke .env Sekarang
+              </button>
+            </div>
+          )}
 
           {/* Banner if .env.example not found */}
           {!envData?.has_example && (
             <div className="bg-amber-500/10 border border-amber-500/25 p-3.5 rounded-xl flex items-center justify-between gap-3 text-xs">
               <div className="text-amber-200">
-                <span>No </span><code className="font-mono font-bold">.env.example</code><span> template found in server root. You can generate one automatically.</span>
+                <span>Tidak ditemukan template </span><code className="font-mono font-bold">.env.example</code><span> di root server. Anda dapat membuat template baru secara otomatis.</span>
               </div>
               <button
                 onClick={handleInitEnvExample}
                 className="px-3 py-1 bg-amber-500 text-slate-950 font-semibold text-xs rounded-lg shrink-0 hover:bg-amber-400"
               >
-                Create .env.example
+                Buat .env.example
               </button>
             </div>
           )}
@@ -1420,7 +1516,7 @@ export const ServerDetailView: React.FC<ServerDetailViewProps> = ({
           <div className="space-y-3">
             {Object.keys(envValues).length === 0 ? (
               <div className="p-8 text-center text-xs text-slate-500 italic bg-black/20 rounded-xl border border-white/[0.04]">
-                No environment variables configured yet. Add one below or generate a template.
+                Belum ada variabel konfigurasi. Tambahkan variabel di bawah atau buat template baru.
               </div>
             ) : (
               Object.entries(envValues).map(([key, val]) => {
@@ -1435,7 +1531,7 @@ export const ServerDetailView: React.FC<ServerDetailViewProps> = ({
                   >
                     {/* Header: Key & Tag */}
                     <div className="flex items-center justify-between">
-                      <div className="flex items-center gap-2">
+                      <div className="flex items-center gap-2 flex-wrap">
                         <span className="font-mono font-bold text-emerald-400 text-xs">{key}</span>
                         {isTemplate && (
                           <span className="text-[10px] px-1.5 py-0.2 rounded bg-cyan-500/15 text-cyan-300 border border-cyan-500/20">
@@ -1444,7 +1540,7 @@ export const ServerDetailView: React.FC<ServerDetailViewProps> = ({
                         )}
                         {meta?.example_value && (
                           <span className="text-[10px] text-slate-500 font-mono">
-                            example: {meta.example_value}
+                            contoh: {meta.example_value}
                           </span>
                         )}
                       </div>
@@ -1452,7 +1548,7 @@ export const ServerDetailView: React.FC<ServerDetailViewProps> = ({
                       <button
                         onClick={() => setDeleteEnvKey(key)}
                         className="p-1 text-slate-500 hover:text-rose-400 rounded transition-colors"
-                        title="Remove variable"
+                        title="Hapus variabel"
                       >
                         <Trash2 className="w-3.5 h-3.5" />
                       </button>
@@ -1470,7 +1566,7 @@ export const ServerDetailView: React.FC<ServerDetailViewProps> = ({
                       <input
                         type={revealSecrets ? 'text' : 'password'}
                         value={val}
-                        placeholder={meta?.example_value ? `e.g. ${meta.example_value}` : 'value'}
+                        placeholder={meta?.example_value ? `contoh: ${meta.example_value}` : 'nilai'}
                         onChange={(e) => {
                           const updated = e.target.value;
                           setEnvValues((prev) => ({ ...prev, [key]: updated }));
@@ -1478,6 +1574,23 @@ export const ServerDetailView: React.FC<ServerDetailViewProps> = ({
                         className="w-full bg-black/50 border border-white/[0.08] rounded-lg px-3 py-1.5 text-xs text-slate-100 font-mono focus:outline-none focus:border-emerald-500/50"
                       />
                     </div>
+
+                    {/* Quick Button to Use Example Value if current is empty or different */}
+                    {meta?.example_value && val !== meta.example_value && (
+                      <div className="pt-0.5">
+                        <button
+                          type="button"
+                          onClick={() => {
+                            setEnvValues((prev) => ({ ...prev, [key]: meta.example_value! }));
+                            showToast(`Menggunakan nilai contoh: ${meta.example_value}`, 'info');
+                          }}
+                          className="text-[10px] text-cyan-400 hover:text-cyan-300 font-mono flex items-center gap-1 transition-colors"
+                        >
+                          <Sparkles className="w-3 h-3" />
+                          <span>Gunakan nilai template: <span className="underline font-semibold">{meta.example_value}</span></span>
+                        </button>
+                      </div>
+                    )}
                   </div>
                 );
               })

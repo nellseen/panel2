@@ -1,5 +1,5 @@
 import React from 'react';
-import { Terminal, Cpu, RefreshCw, Plus, Menu } from 'lucide-react';
+import { Terminal, RefreshCw, Plus } from 'lucide-react';
 import { EnvironmentInfo } from '../types';
 
 interface NavbarProps {
@@ -9,7 +9,7 @@ interface NavbarProps {
   onRefresh: () => void;
   isRefreshing: boolean;
   onOpenDiagnostics: () => void;
-  onToggleMobileSidebar: () => void;
+  onToggleMobileSidebar?: () => void;
   currentFeatureName?: string;
 }
 
@@ -20,87 +20,63 @@ export const Navbar: React.FC<NavbarProps> = ({
   onRefresh,
   isRefreshing,
   onOpenDiagnostics,
-  onToggleMobileSidebar,
-  currentFeatureName,
 }) => {
   return (
-    <header className="h-16 glass-panel glass-specular border-b border-white/[0.08] px-4 sm:px-6 flex items-center justify-between sticky top-0 z-30">
-      {/* Zone 1: Mobile Toggle + Brand Wordmark */}
-      <div className="flex items-center gap-3">
-        <button
-          onClick={onToggleMobileSidebar}
-          className="p-1.5 rounded-lg text-slate-300 hover:text-white hover:bg-white/[0.06] lg:hidden transition-colors"
-          title="Toggle Navigation Sidebar"
-        >
-          <Menu className="w-5 h-5" />
-        </button>
-
-        <a href="/" className="flex items-center gap-2.5 group">
-          <div className="h-9 w-9 rounded-xl bg-gradient-to-br from-emerald-400 via-teal-500 to-cyan-600 flex items-center justify-center shadow-[0_0_15px_rgba(16,185,129,0.3)] border border-white/20 transition-transform group-hover:scale-105">
-            <Terminal className="w-4 h-4 text-slate-950 stroke-[2.5]" />
-          </div>
-          <span className="text-base font-bold tracking-tight text-white flex items-center gap-1.5 whitespace-nowrap shrink-0">
-            <span>Termux</span>
-            <span className="text-transparent bg-clip-text bg-gradient-to-r from-emerald-400 to-cyan-400">
+    <header className="h-14 glass-panel glass-specular border-b border-white/[0.08] px-3.5 flex items-center justify-between sticky top-0 z-30 w-full">
+      {/* Brand & Termux Runtime Chip */}
+      <div className="flex items-center gap-2 truncate">
+        <div className="h-8 w-8 rounded-xl bg-gradient-to-br from-emerald-400 via-teal-500 to-cyan-600 flex items-center justify-center shadow-[0_0_12px_rgba(16,185,129,0.3)] border border-white/20 shrink-0">
+          <Terminal className="w-4 h-4 text-slate-950 stroke-[2.5]" />
+        </div>
+        <div className="flex flex-col truncate">
+          <div className="flex items-center gap-1.5 leading-none">
+            <span className="text-sm font-bold tracking-tight text-white">Termux</span>
+            <span className="text-sm font-bold text-transparent bg-clip-text bg-gradient-to-r from-emerald-400 to-cyan-400">
               NodePanel
             </span>
-          </span>
-        </a>
+          </div>
+          <div className="flex items-center gap-1 text-[10px] text-slate-400 font-mono mt-0.5 truncate">
+            <span className="text-emerald-400 font-semibold">{runtime?.type_name || 'Termux'}</span>
+            <span>·</span>
+            <span>Node {runtime?.executables?.node ? 'Active' : 'v22'}</span>
+          </div>
+        </div>
       </div>
 
-      {/* Zone 2: Breadcrumb / Active Context Zone */}
-      <div className="hidden md:flex items-center gap-2 text-xs text-slate-400 font-mono">
-        <span>system</span>
-        <span aria-hidden="true">/</span>
-        <span className="text-slate-200">{currentFeatureName || 'dashboard'}</span>
-        {runtime && (
-          <>
-            <span aria-hidden="true">·</span>
-            <button
-              onClick={onOpenDiagnostics}
-              className="text-slate-400 hover:text-emerald-400 transition-colors"
-              title="Click to view doctor diagnostics"
-            >
-              {runtime.type_name}
-            </button>
-          </>
-        )}
-      </div>
-
-      {/* Zone 3: Actions & Live Indicator */}
-      <div className="flex items-center gap-2.5 shrink-0">
-        {/* WebSocket Live Telemetry Indicator */}
+      {/* Action Controls */}
+      <div className="flex items-center gap-1.5 shrink-0">
+        {/* WebSocket Status Indicator */}
         <div
-          className="flex items-center gap-1.5 px-2.5 py-1 rounded-full text-[11px] font-mono border border-white/[0.08] bg-white/[0.02]"
-          title={wsConnected ? 'WebSocket live daemon connection active' : 'Connecting to daemon...'}
+          className="flex items-center gap-1 px-2 py-0.5 rounded-full text-[10px] font-mono border border-white/[0.08] bg-white/[0.03]"
+          title={wsConnected ? 'WebSocket live' : 'Offline / Reconnecting'}
         >
           <span
             className={`w-1.5 h-1.5 rounded-full ${
               wsConnected
                 ? 'bg-emerald-400 shadow-[0_0_8px_rgba(16,185,129,0.8)]'
-                : 'bg-rose-400'
+                : 'bg-rose-400 animate-pulse'
             }`}
           />
-          <span className="hidden sm:inline text-slate-300">{wsConnected ? 'Live' : 'Offline'}</span>
+          <span className="text-slate-300">{wsConnected ? 'Live' : 'Off'}</span>
         </div>
 
         {/* Refresh button */}
         <button
           onClick={onRefresh}
           disabled={isRefreshing}
-          className="p-2 text-slate-400 hover:text-white rounded-lg hover:bg-white/[0.06] transition-colors disabled:opacity-50"
-          title="Refresh servers & system state"
+          className="p-1.5 text-slate-400 hover:text-white rounded-lg hover:bg-white/[0.06] transition-colors disabled:opacity-50"
+          title="Refresh state"
         >
-          <RefreshCw className={`w-4 h-4 ${isRefreshing ? 'animate-spin text-emerald-400' : ''}`} />
+          <RefreshCw className={`w-3.5 h-3.5 ${isRefreshing ? 'animate-spin text-emerald-400' : ''}`} />
         </button>
 
-        {/* Primary Action Button */}
+        {/* New Server Primary Button */}
         <button
           onClick={onOpenCreate}
-          className="flex items-center gap-1.5 bg-gradient-to-r from-emerald-500 to-teal-500 hover:from-emerald-400 hover:to-teal-400 text-slate-950 font-semibold px-3.5 py-1.5 rounded-xl text-xs sm:text-sm shadow-[0_0_20px_rgba(16,185,129,0.3)] transition-all hover:scale-[1.02] active:scale-[0.98] whitespace-nowrap shrink-0"
+          className="flex items-center gap-1 bg-gradient-to-r from-emerald-500 to-teal-500 hover:from-emerald-400 hover:to-teal-400 text-slate-950 font-bold px-2.5 py-1 rounded-lg text-xs shadow-[0_0_15px_rgba(16,185,129,0.25)] transition-all active:scale-95"
         >
-          <Plus className="w-4 h-4 stroke-[2.5]" />
-          <span>New Server</span>
+          <Plus className="w-3.5 h-3.5 stroke-[2.5]" />
+          <span>Server</span>
         </button>
       </div>
     </header>

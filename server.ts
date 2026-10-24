@@ -458,13 +458,6 @@ function appendLog(serverId: string, stream: 'stdout' | 'stderr' | 'system', tex
     stream: logLine.stream,
     text: logLine.text,
   }, serverId);
-
-  // Also broadcast to terminal_data so live terminal streams server logs instantly
-  broadcastWSEvent('terminal_data', {
-    serverId,
-    stream: stream,
-    text: text,
-  }, serverId);
 }
 
 function updateServerStatus(serverId: string, newStatus: ServerStatus, exitCode: number) {
@@ -1603,9 +1596,13 @@ async function main() {
     for (const [key, meta] of exampleVars.entries()) {
       processedKeys.add(key);
       const inActual = actualVars.has(key);
+      const actualVal = inActual ? actualVars.get(key)! : '';
+      // If actual value is empty or .env doesn't exist yet, auto-propose exampleValue
+      const proposedVal = actualVal !== '' ? actualVal : (meta.exampleValue || '');
+
       variables.push({
         key,
-        value: inActual ? actualVars.get(key)! : '',
+        value: proposedVal,
         example_value: meta.exampleValue,
         comment: meta.comment,
         source: inActual ? 'both' : 'example',
@@ -1912,23 +1909,6 @@ API_SECRET_KEY=
         if (payload.action === 'subscribe' && payload.serverId) {
           const subs = wsSubscribers.get(ws);
           if (subs) subs.add(payload.serverId);
-
-          // Deliver current app logs
-          const ap = activeProcesses.get(payload.serverId);
-          const logs = ap ? ap.logs : readServerLogsFromFile(payload.serverId);
-          for (const line of logs) {
-            ws.send(
-              JSON.stringify({
-                event: 'log',
-                data: {
-                  server_id: payload.serverId,
-                  timestamp: line.timestamp,
-                  stream: line.stream,
-                  text: line.text,
-                },
-              })
-            );
-          }
 
           // Deliver current terminal working directory
           const root = path.resolve(SERVERS_DIR, payload.serverId);

@@ -9,6 +9,7 @@ import { DiagnosticsView } from './components/DiagnosticsView';
 import { ActivityLogsView } from './components/ActivityLogsView';
 import { SettingsView } from './components/SettingsView';
 import { CreateServerModal } from './components/CreateServerModal';
+import { MobileBottomNav } from './components/MobileBottomNav';
 
 import {
   ServerModel,
@@ -173,65 +174,46 @@ export default function App() {
   };
 
   return (
-    <div className="min-h-screen bg-slate-950 text-slate-100 flex flex-col font-sans antialiased relative overflow-x-hidden selection:bg-emerald-500/30 selection:text-emerald-300">
-      {/* Ambient Liquid Glass Mesh Glow Orbs in Background */}
+    <div className="min-h-screen bg-slate-950 text-slate-100 flex justify-center font-sans antialiased relative overflow-x-hidden selection:bg-emerald-500/30 selection:text-emerald-300">
+      {/* Ambient Mobile Glow */}
       <div className="fixed inset-0 pointer-events-none overflow-hidden z-0">
-        <div className="absolute -top-[10%] -left-[10%] w-[50vw] h-[50vw] max-w-[650px] max-h-[650px] rounded-full bg-emerald-500/[0.08] blur-[120px]" />
-        <div className="absolute top-[35%] -right-[15%] w-[45vw] h-[45vw] max-w-[600px] max-h-[600px] rounded-full bg-cyan-500/[0.07] blur-[140px]" />
-        <div className="absolute -bottom-[10%] left-[20%] w-[40vw] h-[40vw] max-w-[500px] max-h-[500px] rounded-full bg-teal-500/[0.06] blur-[120px]" />
+        <div className="absolute -top-[10%] left-1/2 -translate-x-1/2 w-96 h-96 rounded-full bg-emerald-500/[0.07] blur-[100px]" />
+        <div className="absolute top-[40%] left-1/2 -translate-x-1/2 w-80 h-80 rounded-full bg-cyan-500/[0.06] blur-[110px]" />
       </div>
 
-      {/* Toast Notification */}
-      {toast && (
-        <div className="fixed bottom-5 right-5 z-50 animate-in fade-in slide-in-from-bottom-3 duration-200">
-          <div
-            className={`px-4 py-2.5 rounded-xl shadow-2xl text-xs font-semibold border backdrop-blur-xl flex items-center gap-2 ${
-              toast.type === 'error'
-                ? 'bg-rose-950/90 text-rose-200 border-rose-500/40 shadow-[0_0_20px_rgba(244,63,94,0.3)]'
-                : 'bg-emerald-950/90 text-emerald-200 border-emerald-500/40 shadow-[0_0_20px_rgba(16,185,129,0.3)]'
-            }`}
-          >
-            <span>{toast.message}</span>
+      {/* Strict Mobile Canvas Container (Tailored for Termux Phone Viewport) */}
+      <div className="w-full max-w-md mx-auto min-h-screen flex flex-col bg-slate-950/90 backdrop-blur-xl border-x border-white/[0.08] shadow-[0_0_50px_rgba(0,0,0,0.8)] relative">
+        {/* Toast Notification */}
+        {toast && (
+          <div className="fixed top-16 inset-x-0 max-w-sm mx-auto px-4 z-50 animate-in fade-in slide-in-from-top-2 duration-200">
+            <div
+              className={`px-3.5 py-2 rounded-xl shadow-2xl text-xs font-semibold border backdrop-blur-xl flex items-center justify-center gap-2 ${
+                toast.type === 'error'
+                  ? 'bg-rose-950/95 text-rose-200 border-rose-500/40 shadow-[0_0_20px_rgba(244,63,94,0.3)]'
+                  : 'bg-emerald-950/95 text-emerald-200 border-emerald-500/40 shadow-[0_0_20px_rgba(16,185,129,0.3)]'
+              }`}
+            >
+              <span>{toast.message}</span>
+            </div>
           </div>
-        </div>
-      )}
+        )}
 
-      {/* Top Navbar */}
-      <Navbar
-        runtime={runtime}
-        wsConnected={wsConnected}
-        onOpenCreate={() => setIsCreateModalOpen(true)}
-        onRefresh={loadAll}
-        isRefreshing={isRefreshing}
-        onOpenDiagnostics={() => {
-          setActiveServerId(null);
-          setCurrentTab('diagnostics');
-        }}
-        onToggleMobileSidebar={() => setIsMobileSidebarOpen(!isMobileSidebarOpen)}
-        currentFeatureName={getCurrentFeatureName()}
-      />
-
-      {/* Main Layout: Persistent Sidebar in EVERY feature + Content Viewport */}
-      <div className="flex-1 flex relative z-10">
-        {/* Persistent Liquid Glass Sidebar Present in Every Feature */}
-        <Sidebar
-          currentTab={currentTab}
-          onSelectTab={(tab) => {
-            setActiveServerId(null);
-            setCurrentTab(tab);
-          }}
-          servers={servers}
-          activeServerId={activeServerId}
-          onSelectServer={(id) => {
-            setActiveServerId(id);
-          }}
+        {/* Top Navbar */}
+        <Navbar
+          runtime={runtime}
+          wsConnected={wsConnected}
           onOpenCreate={() => setIsCreateModalOpen(true)}
-          isOpenMobile={isMobileSidebarOpen}
-          onCloseMobile={() => setIsMobileSidebarOpen(false)}
+          onRefresh={loadAll}
+          isRefreshing={isRefreshing}
+          onOpenDiagnostics={() => {
+            setActiveServerId(null);
+            setCurrentTab('diagnostics');
+          }}
+          currentFeatureName={getCurrentFeatureName()}
         />
 
-        {/* Feature Main Content Area */}
-        <main className="flex-1 p-4 sm:p-6 lg:p-8 max-w-7xl w-full mx-auto overflow-y-auto">
+        {/* Mobile Viewport Main Body (with safe bottom padding for MobileBottomNav) */}
+        <main className="flex-1 px-3 py-3.5 pb-20 overflow-y-auto">
           {activeServerId ? (
             <ServerDetailView
               serverId={activeServerId}
@@ -289,9 +271,21 @@ export default function App() {
             </>
           )}
         </main>
+
+        {/* Mobile Bottom Navigation Bar (Docked) */}
+        <MobileBottomNav
+          currentTab={currentTab}
+          onSelectTab={(tab) => {
+            setActiveServerId(null);
+            setCurrentTab(tab);
+          }}
+          servers={servers}
+          activeServerId={activeServerId}
+          onClearActiveServer={() => setActiveServerId(null)}
+        />
       </div>
 
-      {/* Create Server Modal */}
+      {/* Create Server Modal (Responsive centered) */}
       <CreateServerModal
         isOpen={isCreateModalOpen}
         onClose={() => setIsCreateModalOpen(false)}

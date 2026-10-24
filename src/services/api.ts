@@ -270,8 +270,14 @@ export class WebSocketClient {
   private listeners: Map<string, Set<(data: any) => void>> = new Map();
   public isConnected = false;
   private reconnectTimer: any = null;
+  private subscribedServerId: string | null = null;
 
   connect() {
+    if (this.reconnectTimer) {
+      clearTimeout(this.reconnectTimer);
+      this.reconnectTimer = null;
+    }
+
     if (this.ws && (this.ws.readyState === WebSocket.OPEN || this.ws.readyState === WebSocket.CONNECTING)) {
       return;
     }
@@ -285,6 +291,10 @@ export class WebSocketClient {
       this.ws.onopen = () => {
         this.isConnected = true;
         this.emit('connection', { status: 'open' });
+        // Re-subscribe if we had an active server
+        if (this.subscribedServerId) {
+          this.ws?.send(JSON.stringify({ action: 'subscribe', serverId: this.subscribedServerId }));
+        }
       };
 
       this.ws.onmessage = (event) => {
@@ -301,24 +311,38 @@ export class WebSocketClient {
       this.ws.onclose = () => {
         this.isConnected = false;
         this.emit('connection', { status: 'closed' });
-        this.reconnectTimer = setTimeout(() => this.connect(), 3000);
+        if (!this.reconnectTimer) {
+          this.reconnectTimer = setTimeout(() => {
+            this.reconnectTimer = null;
+            this.connect();
+          }, 3000);
+        }
       };
 
       this.ws.onerror = () => {
         this.isConnected = false;
       };
     } catch (e) {
-      this.reconnectTimer = setTimeout(() => this.connect(), 3000);
+      if (!this.reconnectTimer) {
+        this.reconnectTimer = setTimeout(() => {
+          this.reconnectTimer = null;
+          this.connect();
+        }, 3000);
+      }
     }
   }
 
   subscribeServer(serverId: string) {
+    this.subscribedServerId = serverId;
     if (this.ws && this.ws.readyState === WebSocket.OPEN) {
       this.ws.send(JSON.stringify({ action: 'subscribe', serverId }));
     }
   }
 
   unsubscribeServer(serverId: string) {
+    if (this.subscribedServerId === serverId) {
+      this.subscribedServerId = null;
+    }
     if (this.ws && this.ws.readyState === WebSocket.OPEN) {
       this.ws.send(JSON.stringify({ action: 'unsubscribe', serverId }));
     }
