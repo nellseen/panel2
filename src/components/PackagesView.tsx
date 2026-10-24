@@ -107,8 +107,8 @@ export const PackagesView: React.FC<PackagesViewProps> = ({ runtime }) => {
             <span>Active Manager: <strong className="text-emerald-400 font-mono">{runtime?.package_manager || 'None detected'}</strong></span>
           </div>
           <p className="text-xs text-slate-400">
-            {runtime?.type === 'termux_native'
-              ? 'Native Termux: uses pkg package manager without root privilege requirement.'
+            {runtime?.type === 'android_native' || runtime?.package_manager === 'pkg'
+              ? 'Native System: uses pkg package manager without root privilege requirement.'
               : runtime?.type === 'ubuntu_proot'
               ? 'Ubuntu PRoot Distro: uses apt-get repository with full glibc environment.'
               : 'Linux environment: automated package manager detection and safety locking.'}

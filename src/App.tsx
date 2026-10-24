@@ -181,7 +181,7 @@ export default function App() {
         <div className="absolute top-[40%] left-1/2 -translate-x-1/2 w-80 h-80 rounded-full bg-cyan-500/[0.06] blur-[110px]" />
       </div>
 
-      {/* Strict Mobile Canvas Container (Tailored for Termux Phone Viewport) */}
+      {/* Strict Mobile Canvas Container (Tailored for Mobile Phone Viewport) */}
       <div className="w-full max-w-md mx-auto min-h-screen flex flex-col bg-slate-950/90 backdrop-blur-xl border-x border-white/[0.08] shadow-[0_0_50px_rgba(0,0,0,0.8)] relative">
         {/* Toast Notification */}
         {toast && (

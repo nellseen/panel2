@@ -220,7 +220,7 @@ export const Sidebar: React.FC<SidebarProps> = ({
             <span className="text-[10px] font-mono text-emerald-400">Active</span>
           </div>
           <p className="text-[10px] text-slate-400 leading-tight">
-            Single Go binary process engine with SQLite storage.
+            Lightweight process supervisor with SQLite storage.
           </p>
         </div>
       </aside>

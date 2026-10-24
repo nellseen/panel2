@@ -84,7 +84,7 @@ export const DiagnosticsView: React.FC<DiagnosticsViewProps> = ({ runtime, onRef
 
           {runtime.prefix && (
             <div className="bg-black/30 p-3 rounded-xl border border-white/[0.04] text-xs font-mono">
-              <span className="text-slate-500 text-[10px] block">TERMUX PREFIX PATH</span>
+              <span className="text-slate-500 text-[10px] block">SYSTEM PREFIX PATH</span>
               <code className="text-slate-300">{runtime.prefix}</code>
             </div>
           )}
@@ -95,15 +95,15 @@ export const DiagnosticsView: React.FC<DiagnosticsViewProps> = ({ runtime, onRef
           <div className="space-y-3">
             <span className="text-xs font-mono uppercase tracking-wider text-amber-400 font-semibold flex items-center gap-2">
               <BatteryCharging className="w-4 h-4" />
-              <span>Android Power Guidelines</span>
+              <span>Background Power Guidelines</span>
             </span>
             <p className="text-xs text-slate-300 leading-relaxed">
-              Android suspends apps when the device enters deep sleep. Keep your node apps alive:
+              Mobile systems suspend apps when entering deep sleep. Keep your node apps alive:
             </p>
             <ul className="text-xs text-slate-400 space-y-1.5 list-disc pl-4 font-mono">
-              <li>Run <code className="text-amber-300">termux-wake-lock</code></li>
+              <li>Acquire wake-lock / keep-alive</li>
               <li>Set Battery: Unrestricted</li>
-              <li>Install Termux:Boot for auto-start</li>
+              <li>Enable background service auto-start</li>
             </ul>
           </div>
         </div>

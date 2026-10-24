@@ -107,7 +107,7 @@ export const CreateServerModal: React.FC<CreateServerModalProps> = ({
 
         <h3 className="text-lg font-bold text-white mb-1">Create Node.js Instance</h3>
         <p className="text-xs text-slate-400 mb-5">
-          Deploy an application managed directly by the Termux supervisor
+          Deploy an application managed directly by the NodePanel supervisor
         </p>
 
         {/* Tabs: Starter Template vs Git Clone */}

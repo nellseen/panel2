@@ -62,7 +62,7 @@ export interface PackageSpec {
 }
 
 export interface EnvironmentInfo {
-  type: 'termux_native' | 'ubuntu_proot' | 'linux_generic' | 'unknown';
+  type: 'android_native' | 'ubuntu_proot' | 'linux_generic' | 'unknown';
   type_name: string;
   os: string;
   arch: string;
@@ -71,7 +71,7 @@ export interface EnvironmentInfo {
   distro: string;
   distro_version: string;
   prefix: string;
-  termux_version: string;
+  system_version?: string;
   is_proot: boolean;
   package_manager: string;
   executables: Record<string, string>;

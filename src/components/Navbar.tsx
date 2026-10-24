@@ -23,20 +23,20 @@ export const Navbar: React.FC<NavbarProps> = ({
 }) => {
   return (
     <header className="h-14 glass-panel glass-specular border-b border-white/[0.08] px-3.5 flex items-center justify-between sticky top-0 z-30 w-full">
-      {/* Brand & Termux Runtime Chip */}
+      {/* Brand & Runtime Chip */}
       <div className="flex items-center gap-2 truncate">
         <div className="h-8 w-8 rounded-xl bg-gradient-to-br from-emerald-400 via-teal-500 to-cyan-600 flex items-center justify-center shadow-[0_0_12px_rgba(16,185,129,0.3)] border border-white/20 shrink-0">
           <Terminal className="w-4 h-4 text-slate-950 stroke-[2.5]" />
         </div>
         <div className="flex flex-col truncate">
           <div className="flex items-center gap-1.5 leading-none">
-            <span className="text-sm font-bold tracking-tight text-white">Termux</span>
+            <span className="text-sm font-bold tracking-tight text-white">Node</span>
             <span className="text-sm font-bold text-transparent bg-clip-text bg-gradient-to-r from-emerald-400 to-cyan-400">
-              NodePanel
+              Panel
             </span>
           </div>
           <div className="flex items-center gap-1 text-[10px] text-slate-400 font-mono mt-0.5 truncate">
-            <span className="text-emerald-400 font-semibold">{runtime?.type_name || 'Termux'}</span>
+            <span className="text-emerald-400 font-semibold">{runtime?.type_name || 'System'}</span>
             <span>·</span>
             <span>Node {runtime?.executables?.node ? 'Active' : 'v22'}</span>
           </div>

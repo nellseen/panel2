@@ -309,12 +309,12 @@ function detectEnvironment() {
     }
   } catch {}
 
-  let envType: 'termux_native' | 'ubuntu_proot' | 'linux_generic' | 'unknown' = 'linux_generic';
+  let envType: 'android_native' | 'termux_native' | 'ubuntu_proot' | 'linux_generic' | 'unknown' = 'linux_generic';
   let typeName = `Linux (${distro})`;
 
   if (isTermux && !isProot) {
-    envType = 'termux_native';
-    typeName = 'Termux (Native Android)';
+    envType = 'android_native';
+    typeName = 'Native Android';
   } else if (isProot) {
     envType = 'ubuntu_proot';
     typeName = 'Ubuntu (proot-distro)';
@@ -328,7 +328,7 @@ function detectEnvironment() {
   }
 
   let packageManager = 'none';
-  if (envType === 'termux_native') {
+  if (envType === 'android_native') {
     if (executables['pkg']) packageManager = 'pkg';
     else if (executables['apt']) packageManager = 'apt';
   } else {
@@ -347,10 +347,10 @@ function detectEnvironment() {
   ];
   const limitations: string[] = [];
 
-  if (envType === 'termux_native') {
-    capabilities.push('Termux Package Management (pkg)');
-    limitations.push('Android battery optimization may kill background processes unless Wake Lock is acquired');
-    limitations.push('Runs with non-root Android application sandbox permissions');
+  if (envType === 'android_native') {
+    capabilities.push('Native Package Management (pkg)');
+    limitations.push('Mobile battery optimization may kill background processes unless Wake Lock is acquired');
+    limitations.push('Runs with non-root sandbox permissions');
   } else if (envType === 'ubuntu_proot') {
     capabilities.push('Debian/Ubuntu APT Package Management', 'Full glibc compatibility');
     limitations.push('No systemd daemon support inside proot');

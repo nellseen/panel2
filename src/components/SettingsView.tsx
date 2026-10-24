@@ -28,7 +28,7 @@ export const SettingsView: React.FC<SettingsViewProps> = ({ runtime }) => {
             <span>Network Binding & Loopback Security</span>
           </h3>
           <p className="text-xs text-slate-300 leading-relaxed">
-            By default, Termux NodePanel binds strictly to the loopback interface (<code className="text-emerald-400 font-mono">127.0.0.1</code>) to prevent unauthorized access across local Wi-Fi or cellular networks.
+            By default, NodePanel binds strictly to the loopback interface (<code className="text-emerald-400 font-mono">127.0.0.1</code>) to prevent unauthorized access across local Wi-Fi or cellular networks.
           </p>
 
           <div className="bg-black/30 p-4 rounded-xl border border-white/[0.04] space-y-2 text-xs font-mono">
@@ -54,7 +54,7 @@ export const SettingsView: React.FC<SettingsViewProps> = ({ runtime }) => {
             <span>Process Supervisor & Limits</span>
           </h3>
           <p className="text-xs text-slate-300 leading-relaxed">
-            Node.js package installation (<code className="text-cyan-400 font-mono">npm install</code>) is memory-intensive. On Android devices, Termux NodePanel enforces a hardware-safe concurrency semaphore (max 1 concurrent install) to prevent Android Low Memory Killer (OOM).
+            Node.js package installation (<code className="text-cyan-400 font-mono">npm install</code>) is memory-intensive. On mobile devices, NodePanel enforces a hardware-safe concurrency semaphore (max 1 concurrent install) to prevent Low Memory Killer (OOM).
           </p>
 
           <div className="bg-black/30 p-4 rounded-xl border border-white/[0.04] space-y-2 text-xs font-mono">
