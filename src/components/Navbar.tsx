@@ -15,6 +15,7 @@ export interface NavbarProps {
   isRefreshing: boolean;
   onToggleMobileSidebar: () => void;
   currentFeatureName: string;
+  onNavigateLanding?: () => void;
 }
 
 export const Navbar: React.FC<NavbarProps> = ({
@@ -28,6 +29,7 @@ export const Navbar: React.FC<NavbarProps> = ({
   isRefreshing,
   onToggleMobileSidebar,
   currentFeatureName,
+  onNavigateLanding,
 }) => {
   const { runningJobs, openJobsModal } = useJobs();
 
@@ -44,13 +46,24 @@ export const Navbar: React.FC<NavbarProps> = ({
         />
 
         <div className="flex items-center gap-2.5 min-w-0">
-          <div className="h-8 w-8 rounded-lg bg-[#12151B] border border-[#262C36] flex items-center justify-center shrink-0">
+          <button
+            type="button"
+            onClick={onNavigateLanding}
+            title="Go to NodePanel Landing Page"
+            className="h-8 w-8 rounded-lg bg-[#12151B] border border-[#262C36] flex items-center justify-center shrink-0 hover:border-emerald-500/40 transition-colors cursor-pointer"
+          >
             <Terminal className="w-4 h-4 text-emerald-400" aria-hidden="true" />
-          </div>
+          </button>
 
           <div className="min-w-0">
             <div className="flex items-center gap-2 leading-none">
-              <span className="text-sm font-semibold tracking-tight text-[#F3F5F8]">NodePanel</span>
+              <button
+                type="button"
+                onClick={onNavigateLanding}
+                className="text-sm font-semibold tracking-tight text-[#F3F5F8] hover:text-emerald-400 transition-colors cursor-pointer"
+              >
+                NodePanel
+              </button>
               <span className="hidden sm:inline text-[#323A48]" aria-hidden="true">
                 /
               </span>
@@ -71,6 +84,16 @@ export const Navbar: React.FC<NavbarProps> = ({
       </div>
 
       <div className="flex items-center gap-2.5 shrink-0">
+        {onNavigateLanding && (
+          <button
+            type="button"
+            onClick={onNavigateLanding}
+            className="hidden sm:inline-flex items-center px-2.5 py-1 rounded-lg text-xs font-medium text-[#8A94A6] hover:text-[#F3F5F8] bg-[#12151B] hover:bg-[#1A1F29] border border-[#242A35] transition-colors cursor-pointer"
+            title="Buka Landing Page / About"
+          >
+            About
+          </button>
+        )}
         {/* Running Jobs Global Center Indicator */}
         <button
           type="button"

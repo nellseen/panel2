@@ -9,6 +9,7 @@ import {
   Settings,
   ShieldCheck,
   Stethoscope,
+  Terminal,
 } from 'lucide-react';
 import { ServerModel, TabType } from '../types';
 import { Drawer, IconButton } from './ui';
@@ -27,6 +28,7 @@ export interface SidebarProps {
   onCloseMobile?: () => void;
   isCollapsed?: boolean;
   onToggleCollapse?: () => void;
+  onNavigateLanding?: () => void;
 }
 
 const SidebarBody: React.FC<{
@@ -38,6 +40,7 @@ const SidebarBody: React.FC<{
   onOpenCreate: () => void;
   onNavigateDone?: () => void;
   isCollapsed?: boolean;
+  onNavigateLanding?: () => void;
 }> = ({
   currentTab,
   onSelectTab,
@@ -47,6 +50,7 @@ const SidebarBody: React.FC<{
   onOpenCreate,
   onNavigateDone,
   isCollapsed = false,
+  onNavigateLanding,
 }) => {
   const runningCount = servers.filter((s) => s.status === 'running').length;
 
@@ -205,6 +209,25 @@ const SidebarBody: React.FC<{
             </div>
           )}
         </div>
+
+        {onNavigateLanding && (
+          <div className="pt-2">
+            <button
+              type="button"
+              onClick={() => {
+                onNavigateLanding();
+                onNavigateDone?.();
+              }}
+              className={`w-full flex items-center ${
+                isCollapsed ? 'justify-center p-2.5' : 'justify-start gap-2.5 px-2.5 py-2'
+              } rounded-lg text-xs text-[#8A94A6] hover:text-[#F3F5F8] hover:bg-[#11141A] transition-colors font-medium border border-transparent`}
+              title="Buka Landing Page / About"
+            >
+              <Terminal className="w-4 h-4 text-[#697386] shrink-0" />
+              {!isCollapsed && <span>About & Landing</span>}
+            </button>
+          </div>
+        )}
       </div>
 
       <div className="p-3 border-t border-[#181C24] bg-[#090B0E]">
@@ -242,6 +265,7 @@ export const Sidebar: React.FC<SidebarProps> = ({
   onCloseMobile,
   isCollapsed = false,
   onToggleCollapse,
+  onNavigateLanding,
 }) => {
   return (
     <>
@@ -284,6 +308,7 @@ export const Sidebar: React.FC<SidebarProps> = ({
             onSelectServer={onSelectServer}
             onOpenCreate={onOpenCreate}
             isCollapsed={isCollapsed}
+            onNavigateLanding={onNavigateLanding}
           />
         </div>
       </aside>
@@ -302,6 +327,7 @@ export const Sidebar: React.FC<SidebarProps> = ({
           onOpenCreate={onOpenCreate}
           onNavigateDone={onCloseMobile}
           isCollapsed={false}
+          onNavigateLanding={onNavigateLanding}
         />
       </Drawer>
     </>

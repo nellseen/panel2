@@ -26,14 +26,21 @@ test.describe('Termux NodePanel — End-to-End Browser Verification Suite', () =
       }
     });
 
-    // --- Scenario 1: Dashboard opens cleanly on Premium Black (#08090B) canvas ---
+    // --- Scenario 1: Entry Point Landing Page -> Mulai Sekarang -> Dashboard Overview ---
     await page.goto('/');
-    await expect(page.getByRole('heading', { name: 'Overview', level: 1 })).toBeVisible();
+    
+    // 1. Verify Landing Page renders on "/" with identity, purpose and CTA
+    await expect(
+      page.getByRole('heading', { name: /Your Servers\. One Powerful Control Panel\./i })
+    ).toBeVisible();
+    await expect(
+      page.getByText(/Kelola server Node\.js, pantau proses realtime/i)
+    ).toBeVisible();
 
     const bgColor = await page.evaluate(() => getComputedStyle(document.body).backgroundColor);
     expect(bgColor).toBe('rgb(8, 9, 11)');
 
-    const initialBootId = await page.evaluate(
+    let initialBootId = await page.evaluate(
       () => (window as unknown as { __bootId?: string }).__bootId
     );
     expect(initialBootId).toBeTruthy();
@@ -43,6 +50,34 @@ test.describe('Termux NodePanel — End-to-End Browser Verification Suite', () =
       () => document.documentElement.scrollWidth > document.documentElement.clientWidth
     );
     expect(desktopOverflow).toBe(false);
+
+    // 2. Click "Mulai Sekarang" to navigate to Dashboard Overview
+    const startNowBtn = page.getByRole('button', { name: /Mulai Sekarang/i }).first();
+    await startNowBtn.click();
+
+    // 3. Verify Overview console opens with zero full-page reload
+    await expect(page.getByRole('heading', { name: 'Overview', level: 1 })).toBeVisible();
+    const navBootId = await page.evaluate(
+      () => (window as unknown as { __bootId?: string }).__bootId
+    );
+    expect(navBootId).toBe(initialBootId);
+
+    // 4. Test browser Back: returns to Landing Page
+    await page.goBack();
+    await expect(
+      page.getByRole('heading', { name: /Your Servers\. One Powerful Control Panel\./i })
+    ).toBeVisible();
+
+    // 5. Test browser Forward: returns to Overview
+    await page.goForward();
+    await expect(page.getByRole('heading', { name: 'Overview', level: 1 })).toBeVisible();
+
+    // 6. Test direct browser refresh on /overview
+    await page.reload();
+    await expect(page.getByRole('heading', { name: 'Overview', level: 1 })).toBeVisible();
+    initialBootId = await page.evaluate(
+      () => (window as unknown as { __bootId?: string }).__bootId
+    );
 
     // --- Scenario 2: Primary navigation across all 6 console sections ---
     const sidebarNav = page.getByRole('navigation', { name: 'Main navigation' });

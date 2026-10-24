@@ -8,6 +8,8 @@ import { CreateServerModal } from './components/CreateServerModal';
 import { Alert, Button, ErrorBoundary, Skeleton, ToastViewport } from './components/ui';
 import { JobProvider, useJobs } from './context/JobContext';
 import { RunningJobsModal } from './components/RunningJobsModal';
+import { LandingPageView } from './components/LandingPageView';
+import { formatRoutePath, navigateTo, parseRoute, RouteState } from './utils/routing';
 
 const ServerDetailView = lazy(() =>
   import('./components/ServerDetailView').then((m) => ({ default: m.ServerDetailView }))
@@ -50,9 +52,20 @@ import {
 import { isAbortError, normalizeError } from './utils/errors';
 import { applyServerStatusUpdate, reconcileServerList } from './utils/serverLifecycle';
 
-export default function App() {
-  const [currentTab, setCurrentTab] = useState<TabType>('dashboard');
-  const [activeServerId, setActiveServerId] = useState<string | null>(null);
+export interface AppProps {
+  initialPath?: string;
+}
+
+export default function App({ initialPath }: AppProps = {}) {
+  const [currentRoute, setCurrentRoute] = useState<RouteState>(() => {
+    if (initialPath) {
+      return parseRoute(initialPath);
+    }
+    if (typeof window !== 'undefined') {
+      return parseRoute(window.location.pathname);
+    }
+    return { view: 'landing', tab: 'dashboard', serverId: null, path: '/' };
+  });
 
   const [runtime, setRuntime] = useState<EnvironmentInfo | null>(null);
   const [servers, setServers] = useState<ServerModel[]>([]);
@@ -76,6 +89,21 @@ export default function App() {
   const syncSeqRef = useRef(0);
   const activeAbortRef = useRef<AbortController | null>(null);
   const mountedRef = useRef(true);
+
+  // Sync route on popstate (browser back/forward or programmatic navigation)
+  useEffect(() => {
+    const handlePopState = () => {
+      if (typeof window !== 'undefined') {
+        const parsed = parseRoute(window.location.pathname);
+        setCurrentRoute(parsed);
+      }
+    };
+
+    window.addEventListener('popstate', handlePopState);
+    return () => {
+      window.removeEventListener('popstate', handlePopState);
+    };
+  }, []);
 
   const pushToast = useCallback(
     (
@@ -154,7 +182,14 @@ export default function App() {
     }
   }, []);
 
+  const isConsoleActive = currentRoute.view === 'console';
+
+  // Only run active WebSocket connection and polling when user is in the console
   useEffect(() => {
+    if (!isConsoleActive) {
+      return;
+    }
+
     mountedRef.current = true;
     const bootTimer = globalThis.setTimeout(() => {
       void syncAll({ silent: true });
@@ -211,7 +246,21 @@ export default function App() {
       unsubReconnected();
       wsClient.disconnect();
     };
-  }, [syncAll]);
+  }, [isConsoleActive, syncAll]);
+
+  const handleNavigateTab = useCallback((tab: TabType) => {
+    const targetPath = formatRoutePath('console', tab, null);
+    navigateTo(targetPath);
+  }, []);
+
+  const handleSelectServer = useCallback((serverId: string | null) => {
+    const targetPath = formatRoutePath('console', 'servers', serverId);
+    navigateTo(targetPath);
+  }, []);
+
+  const handleNavigateLanding = useCallback(() => {
+    navigateTo('/');
+  }, []);
 
   const setServerPending = useCallback((id: string, action?: PendingServerAction) => {
     setPendingActions((prev) => {
@@ -281,9 +330,8 @@ export default function App() {
       try {
         await deleteServer(id);
         setServers((prev) => prev.filter((s) => s.id !== id));
-        if (activeServerId === id) {
-          setActiveServerId(null);
-          setCurrentTab('servers');
+        if (currentRoute.serverId === id) {
+          handleSelectServer(null);
         }
         pushToast('Server deleted', 'success', 'Instance workspace and records removed.');
         await syncAll({ silent: true });
@@ -294,7 +342,7 @@ export default function App() {
         setServerPending(id, undefined);
       }
     },
-    [activeServerId, pushToast, setServerPending, syncAll]
+    [currentRoute.serverId, handleSelectServer, pushToast, setServerPending, syncAll]
   );
 
   const handleCreateServer = useCallback(
@@ -303,17 +351,17 @@ export default function App() {
       setServers((prev) => reconcileServerList(prev, [...prev, created]));
       pushToast(`Created ${created.name}`, 'success', `Assigned port :${created.port}`);
       await syncAll({ silent: true });
-      setActiveServerId(created.id);
+      handleSelectServer(created.id);
     },
-    [pushToast, syncAll]
+    [handleSelectServer, pushToast, syncAll]
   );
 
   const getCurrentFeatureName = (): string => {
-    if (activeServerId) {
-      const activeSrv = servers.find((s) => s.id === activeServerId);
-      return activeSrv ? `servers / ${activeSrv.name}` : `servers / ${activeServerId}`;
+    if (currentRoute.serverId) {
+      const activeSrv = servers.find((s) => s.id === currentRoute.serverId);
+      return activeSrv ? `servers / ${activeSrv.name}` : `servers / ${currentRoute.serverId}`;
     }
-    switch (currentTab) {
+    switch (currentRoute.tab) {
       case 'dashboard':
         return 'overview';
       case 'servers':
@@ -331,17 +379,28 @@ export default function App() {
     }
   };
 
-  const activeServerSummary = activeServerId
-    ? servers.find((s) => s.id === activeServerId) ?? null
+  const activeServerSummary = currentRoute.serverId
+    ? servers.find((s) => s.id === currentRoute.serverId) ?? null
     : null;
 
+  if (currentRoute.view === 'landing') {
+    return (
+      <>
+        <LandingPageView
+          onStartNow={() => handleNavigateTab('dashboard')}
+        />
+        <ToastViewport toasts={toasts} onDismiss={dismissToast} />
+      </>
+    );
+  }
+
   return (
-    <JobProvider activeServerId={activeServerId} onNotify={pushToast}>
+    <JobProvider activeServerId={currentRoute.serverId} onNotify={pushToast}>
       <AppContent
-        currentTab={currentTab}
-        setCurrentTab={setCurrentTab}
-        activeServerId={activeServerId}
-        setActiveServerId={setActiveServerId}
+        currentTab={currentRoute.tab}
+        setCurrentTab={handleNavigateTab}
+        activeServerId={currentRoute.serverId}
+        setActiveServerId={handleSelectServer}
         runtime={runtime}
         servers={servers}
         activities={activities}
@@ -367,6 +426,7 @@ export default function App() {
         handleCreateServer={handleCreateServer}
         getCurrentFeatureName={getCurrentFeatureName}
         activeServerSummary={activeServerSummary}
+        onNavigateLanding={handleNavigateLanding}
       />
     </JobProvider>
   );
@@ -402,6 +462,7 @@ interface AppContentProps {
   handleCreateServer: (payload: CreateServerPayload) => Promise<void>;
   getCurrentFeatureName: () => string;
   activeServerSummary: ServerModel | null;
+  onNavigateLanding?: () => void;
 }
 
 function AppContent({
@@ -434,6 +495,7 @@ function AppContent({
   handleCreateServer,
   getCurrentFeatureName,
   activeServerSummary,
+  onNavigateLanding,
 }: AppContentProps) {
   const { isJobsModalOpen, closeJobsModal } = useJobs();
   const [isSidebarCollapsed, setIsSidebarCollapsed] = useState(false);
@@ -451,6 +513,7 @@ function AppContent({
         isRefreshing={isRefreshing}
         onToggleMobileSidebar={() => setIsMobileSidebarOpen((v) => !v)}
         currentFeatureName={getCurrentFeatureName()}
+        onNavigateLanding={onNavigateLanding}
       />
 
       <div className="flex-1 flex min-h-0 overflow-hidden">
@@ -468,6 +531,7 @@ function AppContent({
           onCloseMobile={() => setIsMobileSidebarOpen(false)}
           isCollapsed={isSidebarCollapsed}
           onToggleCollapse={() => setIsSidebarCollapsed((v) => !v)}
+          onNavigateLanding={onNavigateLanding}
         />
 
         <main className="flex-1 overflow-y-auto px-4 py-5 sm:px-6 lg:px-8 pb-28 lg:pb-8">

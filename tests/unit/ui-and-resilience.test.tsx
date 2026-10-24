@@ -285,7 +285,7 @@ describe('Bug A Regression: App preserves last valid server data during transien
       return new Response(JSON.stringify({}), { status: 200 });
     });
 
-    render(<App />);
+    render(<App initialPath="/overview" />);
 
     // 1. Verify initial render displays Alpha Payment Service card
     expect(await screen.findByTestId('server-card-srv-90001-11223344')).toBeInTheDocument();

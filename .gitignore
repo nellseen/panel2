@@ -9,3 +9,10 @@ blob-report/
 *.log
 .env*
 !.env.example
+
+# AI Studio & Prompt artifacts
+.aistudio/
+*aistudio*
+prompt*.txt
+*prompt*.txt
+*.prompt.txt
