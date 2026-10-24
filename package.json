@@ -7,10 +7,16 @@
     "dev": "tsx server.ts",
     "build": "vite build",
     "preview": "vite preview",
-    "start": "tsx server.ts",
+    "start": "node server.ts",
     "clean": "rm -rf dist",
-    "lint": "tsc --noEmit",
-    "test": "npm run lint"
+    "typecheck": "tsc --noEmit",
+    "lint": "eslint src server.ts tests",
+    "test:unit": "vitest run --config vitest.config.ts",
+    "test:integration": "vitest run --config vitest.integration.config.ts",
+    "test:e2e": "playwright test",
+    "test:load": "node tests/load/run-load-test.mjs",
+    "test:all": "npm run typecheck && npm run lint && npm run test:unit && npm run test:integration && npm run build && npm run test:e2e",
+    "test": "npm run typecheck && npm run lint && npm run test:unit && npm run test:integration"
   },
   "dependencies": {
     "@google/genai": "^2.4.0",
@@ -26,15 +32,26 @@
     "ws": "^8.22.0"
   },
   "devDependencies": {
+    "@eslint/js": "^10.0.1",
+    "@playwright/test": "^1.64.1",
+    "@testing-library/jest-dom": "^7.0.1",
+    "@testing-library/react": "^16.3.3",
+    "@testing-library/user-event": "^14.6.8",
     "@types/express": "^4.17.21",
     "@types/node": "^22.14.0",
     "@types/react": "^19.3.0",
     "@types/react-dom": "^19.3.0",
     "@types/ws": "^8.18.2",
+    "autocannon": "^8.0.0",
     "autoprefixer": "^10.4.21",
-    "esbuild": "^0.25.0",
+    "esbuild": "^0.28.0",
+    "eslint": "^10.13.0",
+    "eslint-plugin-react-hooks": "^7.1.1",
+    "jsdom": "^30.1.3",
     "tailwindcss": "^4.3.3",
     "tsx": "^4.21.0",
-    "typescript": "^7.0.2"
+    "typescript": "^5.8.3",
+    "typescript-eslint": "^8.72.0",
+    "vitest": "^5.0.5"
   }
 }

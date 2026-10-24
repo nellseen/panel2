@@ -16,12 +16,76 @@
         "DATABASE_URL": "mongodb://localhost:27017/test"
       },
       "created_at": "2026-10-24T06:15:59Z",
-      "updated_at": "2026-10-24T08:29:44.584Z",
+      "updated_at": "2026-10-24T13:54:51.046Z",
       "repo_url": "",
       "last_exit_code": 1
     }
   ],
   "activities": [
+    {
+      "id": "1792850091046dsde",
+      "timestamp": "2026-10-24T13:54:51.047Z",
+      "action": "stop_server",
+      "server_id": "srv-22559-94a65378",
+      "details": "Server stopped gracefully",
+      "status": "success"
+    },
+    {
+      "id": "1792850090230p1av",
+      "timestamp": "2026-10-24T13:54:50.230Z",
+      "action": "restart_server",
+      "server_id": "srv-22559-94a65378",
+      "details": "Server restarted",
+      "status": "success"
+    },
+    {
+      "id": "1792850090229ivo4",
+      "timestamp": "2026-10-24T13:54:50.229Z",
+      "action": "start_server",
+      "server_id": "srv-22559-94a65378",
+      "details": "Server 'Live Production Test' started (PID: 1724)",
+      "status": "success"
+    },
+    {
+      "id": "1792850088749rrdx",
+      "timestamp": "2026-10-24T13:54:48.749Z",
+      "action": "start_server",
+      "server_id": "srv-22559-94a65378",
+      "details": "Server 'Live Production Test' started (PID: 1695)",
+      "status": "success"
+    },
+    {
+      "id": "1792849665583lr0v",
+      "timestamp": "2026-10-24T13:47:45.583Z",
+      "action": "stop_server",
+      "server_id": "srv-22559-94a65378",
+      "details": "Server stopped gracefully",
+      "status": "success"
+    },
+    {
+      "id": "1792849664573laly",
+      "timestamp": "2026-10-24T13:47:44.573Z",
+      "action": "restart_server",
+      "server_id": "srv-22559-94a65378",
+      "details": "Server restarted",
+      "status": "success"
+    },
+    {
+      "id": "1792849664573jjsz",
+      "timestamp": "2026-10-24T13:47:44.573Z",
+      "action": "start_server",
+      "server_id": "srv-22559-94a65378",
+      "details": "Server 'Live Production Test' started (PID: 381)",
+      "status": "success"
+    },
+    {
+      "id": "1792849663152f8ld",
+      "timestamp": "2026-10-24T13:47:43.152Z",
+      "action": "start_server",
+      "server_id": "srv-22559-94a65378",
+      "details": "Server 'Live Production Test' started (PID: 374)",
+      "status": "success"
+    },
     {
       "id": "17928305845843xkj",
       "timestamp": "2026-10-24T08:29:44.584Z",

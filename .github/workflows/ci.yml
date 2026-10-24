@@ -1,0 +1,102 @@
+name: NodePanel Quality Gates & Test Pipeline
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+    branches: [main, master]
+  workflow_dispatch:
+    inputs:
+      run_load_test:
+        description: 'Run Stage 5 Load & WebSocket Concurrency Test'
+        required: false
+        default: 'true'
+        type: choice
+        options:
+          - 'true'
+          - 'false'
+  schedule:
+    - cron: '0 3 * * 1'
+
+permissions:
+  contents: read
+
+jobs:
+  quality-gates:
+    name: Static, Unit, Integration, Build & E2E
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js 22
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: 'npm'
+
+      - name: Install reproducible dependencies
+        run: npm ci
+
+      - name: Stage 1a — TypeScript Typecheck
+        run: npm run typecheck
+
+      - name: Stage 1b — ESLint Static Analysis
+        run: npm run lint
+
+      - name: Stage 2 — Unit & Regression Tests
+        run: npm run test:unit
+
+      - name: Stage 3 — Isolated API, Supervisor & WebSocket Integration Tests
+        run: npm run test:integration
+
+      - name: Stage 1c — Production Frontend Build
+        run: npm run build
+
+      - name: Install Playwright Chromium Browser
+        run: npx playwright install --with-deps chromium
+
+      - name: Stage 4 — Playwright Browser E2E Suite
+        run: npm run test:e2e
+
+      - name: Upload Playwright & Test Artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: e2e-diagnostics-and-reports
+          path: |
+            test-results/
+            playwright-report/
+          if-no-files-found: ignore
+
+  load-test:
+    name: Stage 5 — Staged HTTP & WS Load Test
+    needs: quality-gates
+    if: github.event_name == 'schedule' || (github.event_name == 'workflow_dispatch' && inputs.run_load_test == 'true')
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js 22
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: 'npm'
+
+      - name: Install reproducible dependencies
+        run: npm ci
+
+      - name: Execute Stage 5 Load & WebSocket Concurrency Suite
+        run: npm run test:load
+
+      - name: Upload Load Test Report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: stage5-load-report
+          path: test-results/load-report.json

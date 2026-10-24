@@ -10,6 +10,26 @@ export type ServerStatus =
 
 export type AutoRestartPolicy = 'never' | 'always' | 'on-failure';
 
+export type ConnectionState = 'connecting' | 'connected' | 'reconnecting' | 'disconnected';
+
+export type PendingServerAction = 'starting' | 'stopping' | 'restarting' | 'deleting' | 'installing';
+
+export type TabType =
+  | 'dashboard'
+  | 'servers'
+  | 'packages'
+  | 'diagnostics'
+  | 'activity'
+  | 'settings';
+
+export interface ServerMetrics {
+  pid: number;
+  status: ServerStatus;
+  uptime_sec: number;
+  memory_mb: number | null;
+  cpu_percent: number | null;
+}
+
 export interface ServerModel {
   id: string;
   name: string;
@@ -25,14 +45,6 @@ export interface ServerModel {
   repo_url?: string;
   last_exit_code: number;
   metrics?: ServerMetrics;
-}
-
-export interface ServerMetrics {
-  pid: number;
-  status: ServerStatus;
-  uptime_sec: number;
-  memory_mb: number;
-  cpu_percent: number;
 }
 
 export interface LogLine {
@@ -62,7 +74,7 @@ export interface PackageSpec {
 }
 
 export interface EnvironmentInfo {
-  type: 'android_native' | 'ubuntu_proot' | 'linux_generic' | 'unknown';
+  type: 'android_native' | 'termux_native' | 'ubuntu_proot' | 'linux_generic' | 'unknown';
   type_name: string;
   os: string;
   arch: string;
@@ -71,14 +83,18 @@ export interface EnvironmentInfo {
   distro: string;
   distro_version: string;
   prefix: string;
+  termux_version?: string;
   system_version?: string;
   is_proot: boolean;
   package_manager: string;
   executables: Record<string, string>;
   capabilities: string[];
   limitations: string[];
-  disk_free_mb: number;
+  disk_free_mb: number | null;
   memory_total_mb: number;
+  memory_free_mb?: number;
+  panel_port?: number;
+  storage_engine?: string;
 }
 
 export interface ActivityLog {
@@ -90,6 +106,8 @@ export interface ActivityLog {
   status: 'success' | 'failed' | 'warning';
 }
 
+export type ServerTemplateId = 'blank' | 'express_api' | 'basic_http' | 'background_worker';
+
 export interface CreateServerPayload {
   name: string;
   description?: string;
@@ -97,7 +115,7 @@ export interface CreateServerPayload {
   entry_file?: string;
   auto_restart?: AutoRestartPolicy;
   env_vars?: Record<string, string>;
-  template?: 'blank' | 'express_api' | 'basic_http' | 'background_worker';
+  template?: ServerTemplateId;
   repo_url?: string;
   branch?: string;
 }
@@ -130,4 +148,18 @@ export interface TerminalState {
   currentCommand: string;
   cwd: string;
   exitCode: number | null;
+}
+
+export interface ConnectionSnapshot {
+  state: ConnectionState;
+  reconnectAttempt: number;
+  nextRetryMs: number | null;
+  lastConnectedAt: string | null;
+}
+
+export interface ToastItem {
+  id: string;
+  title: string;
+  description?: string;
+  variant: 'success' | 'error' | 'warning' | 'info';
 }

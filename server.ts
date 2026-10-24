@@ -1,24 +1,15 @@
-import express, { type Request, type Response } from 'express';
+import express, { type NextFunction, type Request, type Response } from 'express';
 import http from 'http';
 import path from 'path';
 import { fileURLToPath } from 'url';
 import fs from 'fs';
 import os from 'os';
-import { spawn, execSync, type ChildProcess } from 'child_process';
+import { spawn, execFile, type ChildProcess } from 'child_process';
 import { WebSocketServer, WebSocket } from 'ws';
 import crypto from 'crypto';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
-
-const PORT = 3000;
-const isProd = process.env.NODE_ENV === 'production';
-const DATA_DIR = path.join(__dirname, 'data');
-const SERVERS_DIR = path.join(DATA_DIR, 'servers');
-const DB_JSON_PATH = path.join(DATA_DIR, 'nodepanel.json');
-
-// Ensure base storage directories exist
-fs.mkdirSync(SERVERS_DIR, { recursive: true });
 
 // --- Type Definitions ---
 export type ServerStatus =
@@ -32,6 +23,14 @@ export type ServerStatus =
   | 'failed';
 
 export type AutoRestartPolicy = 'never' | 'always' | 'on-failure';
+
+export interface ServerMetrics {
+  pid: number;
+  status: ServerStatus;
+  uptime_sec: number;
+  memory_mb: number | null;
+  cpu_percent: number | null;
+}
 
 export interface ServerModel {
   id: string;
@@ -48,14 +47,6 @@ export interface ServerModel {
   repo_url?: string;
   last_exit_code: number;
   metrics?: ServerMetrics;
-}
-
-export interface ServerMetrics {
-  pid: number;
-  status: ServerStatus;
-  uptime_sec: number;
-  memory_mb: number;
-  cpu_percent: number;
 }
 
 export interface LogLine {
@@ -93,7 +84,43 @@ export interface PackageSpec {
   path?: string;
 }
 
-// --- Persistence Store ---
+export interface PanelServerOptions {
+  dataDir?: string;
+  port?: number;
+  host?: string;
+  isProd?: boolean;
+  enableVite?: boolean;
+  serveStatic?: boolean;
+  apiSecretKey?: string;
+  rateLimitMax?: number;
+  autoRestartBaseMs?: number;
+  maxAutoRestarts?: number;
+  stopGraceTimeoutMs?: number;
+}
+
+export interface PanelServerInstance {
+  app: express.Express;
+  server: http.Server;
+  wss: WebSocketServer;
+  port: number;
+  dataDir: string;
+  close: () => Promise<void>;
+  getActiveProcessCount: () => number;
+  getActivePids: () => number[];
+}
+
+class HttpError extends Error {
+  public statusCode: number;
+  public code: string;
+
+  constructor(statusCode: number, code: string, message: string) {
+    super(message);
+    this.name = 'HttpError';
+    this.statusCode = statusCode;
+    this.code = code;
+  }
+}
+
 interface DatabaseSchema {
   servers: ServerModel[];
   activities: ActivityLog[];
@@ -101,18 +128,23 @@ interface DatabaseSchema {
 
 class JsonStore {
   private data: DatabaseSchema = { servers: [], activities: [] };
+  private dbJsonPath: string;
 
-  constructor() {
+  constructor(dbJsonPath: string) {
+    this.dbJsonPath = dbJsonPath;
     this.load();
+    this.reconcileOnBoot();
   }
 
-  load() {
+  public load(): void {
     try {
-      if (fs.existsSync(DB_JSON_PATH)) {
-        const raw = fs.readFileSync(DB_JSON_PATH, 'utf-8');
-        this.data = JSON.parse(raw);
-        if (!Array.isArray(this.data.servers)) this.data.servers = [];
-        if (!Array.isArray(this.data.activities)) this.data.activities = [];
+      if (fs.existsSync(this.dbJsonPath)) {
+        const raw = fs.readFileSync(this.dbJsonPath, 'utf-8');
+        const parsed = JSON.parse(raw) as Partial<DatabaseSchema>;
+        this.data = {
+          servers: Array.isArray(parsed.servers) ? parsed.servers : [],
+          activities: Array.isArray(parsed.activities) ? parsed.activities : [],
+        };
       } else {
         this.save();
       }
@@ -122,44 +154,75 @@ class JsonStore {
     }
   }
 
-  save() {
+  private reconcileOnBoot(): void {
+    let dirty = false;
+    const transientStates: Set<ServerStatus> = new Set([
+      'running',
+      'starting',
+      'stopping',
+      'installing',
+    ]);
+    for (const srv of this.data.servers) {
+      if (transientStates.has(srv.status)) {
+        srv.status = 'stopped';
+        srv.updated_at = new Date().toISOString();
+        dirty = true;
+      }
+    }
+    if (dirty) {
+      this.save();
+    }
+  }
+
+  public save(): void {
     try {
-      const tempPath = `${DB_JSON_PATH}.tmp.${Date.now()}`;
+      fs.mkdirSync(path.dirname(this.dbJsonPath), { recursive: true });
+      const tempPath = `${this.dbJsonPath}.tmp.${process.pid}.${crypto.randomUUID()}`;
       fs.writeFileSync(tempPath, JSON.stringify(this.data, null, 2), 'utf-8');
-      fs.renameSync(tempPath, DB_JSON_PATH);
+      fs.renameSync(tempPath, this.dbJsonPath);
     } catch (err) {
       console.error('[Store] Failed to save nodepanel.json:', err);
     }
   }
 
-  listServers(): ServerModel[] {
-    return [...this.data.servers];
+  public listServers(): ServerModel[] {
+    return this.data.servers.map((s) => ({ ...s, env_vars: { ...(s.env_vars || {}) } }));
   }
 
-  getServer(id: string): ServerModel | undefined {
-    return this.data.servers.find((s) => s.id === id);
+  public getServer(id: string): ServerModel | undefined {
+    const found = this.data.servers.find((s) => s.id === id);
+    return found ? { ...found, env_vars: { ...(found.env_vars || {}) } } : undefined;
   }
 
-  saveServer(server: ServerModel) {
-    server.updated_at = new Date().toISOString();
-    const idx = this.data.servers.findIndex((s) => s.id === server.id);
+  public saveServer(server: ServerModel): void {
+    const copy: ServerModel = {
+      ...server,
+      env_vars: { ...(server.env_vars || {}) },
+      updated_at: new Date().toISOString(),
+    };
+    const idx = this.data.servers.findIndex((s) => s.id === copy.id);
     if (idx >= 0) {
-      this.data.servers[idx] = server;
+      this.data.servers[idx] = copy;
     } else {
-      if (!server.created_at) server.created_at = server.updated_at;
-      this.data.servers.push(server);
+      if (!copy.created_at) copy.created_at = copy.updated_at;
+      this.data.servers.push(copy);
     }
     this.save();
   }
 
-  deleteServer(id: string) {
+  public deleteServer(id: string): void {
     this.data.servers = this.data.servers.filter((s) => s.id !== id);
     this.save();
   }
 
-  recordActivity(action: string, serverId: string, details: string, status: 'success' | 'failed' | 'warning') {
+  public recordActivity(
+    action: string,
+    serverId: string,
+    details: string,
+    status: 'success' | 'failed' | 'warning'
+  ): void {
     const entry: ActivityLog = {
-      id: Date.now().toString() + Math.random().toString(36).substring(2, 6),
+      id: `${Date.now()}${crypto.randomBytes(3).toString('hex')}`,
       timestamp: new Date().toISOString(),
       action,
       server_id: serverId,
@@ -173,12 +236,10 @@ class JsonStore {
     this.save();
   }
 
-  listActivities(): ActivityLog[] {
+  public listActivities(): ActivityLog[] {
     return [...this.data.activities];
   }
 }
-
-const store = new JsonStore();
 
 // --- Package Registry ---
 const PACKAGE_REGISTRY: Record<string, PackageSpec> = {
@@ -251,718 +312,260 @@ const PACKAGE_REGISTRY: Record<string, PackageSpec> = {
     description: 'GCC/Clang compilers and make tools for building native Node.js modules.',
     executable: 'make',
     category: 'Compilers',
-    pkg_map: { pkg: 'build-essential', 'apt-get': 'build-essential', pacman: 'base-devel', apk: 'build-base' },
+    pkg_map: {
+      pkg: 'build-essential',
+      'apt-get': 'build-essential',
+      pacman: 'base-devel',
+      apk: 'build-base',
+    },
     installed: false,
   },
 };
 
-function lookPath(tool: string): string | null {
-  try {
-    const res = execSync(`which ${tool} 2>/dev/null`, { encoding: 'utf-8' }).trim();
-    return res || null;
-  } catch {
+const SERVER_ID_REGEX = /^srv-[a-zA-Z0-9_-]{1,64}$/;
+const SAFE_SCRIPT_NAME_REGEX = /^[a-zA-Z0-9:_-]{1,64}$/;
+const SAFE_GIT_URL_REGEX = /^(https?:\/\/|git@|ssh:\/\/|file:\/\/)[^\s;|&$`<>'"]+$/i;
+const SAFE_GIT_BRANCH_REGEX = /^[a-zA-Z0-9._/-]{1,120}$/;
+const SAFE_ENV_KEY_REGEX = /^[A-Za-z_][A-Za-z0-9_]{0,127}$/;
+
+/**
+ * Pure non-blocking filesystem PATH lookup without spawning /bin/sh child processes.
+ */
+function lookPathFast(executable: string): string | null {
+  if (!executable || executable.includes('/') || executable.includes('\\')) {
     return null;
   }
-}
-
-function getToolVersion(tool: string): string {
-  try {
-    const out = execSync(`${tool} --version 2>/dev/null`, { encoding: 'utf-8' }).trim();
-    return out.split('\n')[0] || 'Installed';
-  } catch {
-    return 'Installed';
-  }
-}
-
-function detectEnvironment() {
-  const prefix = process.env.PREFIX || '';
-  const termuxVersion = process.env.TERMUX_VERSION || '';
-  const isTermux =
-    prefix.includes('com.termux') ||
-    Boolean(termuxVersion) ||
-    fs.existsSync('/data/data/com.termux/files/usr/bin');
-
-  let isProot =
-    Boolean(process.env.PROOT_TMP_DIR) ||
-    Boolean(process.env.PROOT_FORCE_KILL_SIGNALS) ||
-    fs.existsSync('/proot');
-
-  try {
-    if (fs.existsSync('/etc/issue')) {
-      const issue = fs.readFileSync('/etc/issue', 'utf-8').toLowerCase();
-      if (issue.includes('proot')) isProot = true;
-    }
-  } catch {}
-
-  let distro = 'Linux';
-  let distroVersion = '';
-  try {
-    if (fs.existsSync('/etc/os-release')) {
-      const osRelease = fs.readFileSync('/etc/os-release', 'utf-8');
-      for (const line of osRelease.split('\n')) {
-        if (line.startsWith('PRETTY_NAME=')) {
-          distro = line.replace('PRETTY_NAME=', '').replace(/"/g, '').trim();
-        } else if (line.startsWith('VERSION_ID=')) {
-          distroVersion = line.replace('VERSION_ID=', '').replace(/"/g, '').trim();
-        }
+  const pathEnv = process.env.PATH || '';
+  const dirs = pathEnv.split(path.delimiter).filter(Boolean);
+  for (const dir of dirs) {
+    const full = path.join(dir, executable);
+    try {
+      const stat = fs.statSync(full);
+      if (stat.isFile()) {
+        fs.accessSync(full, fs.constants.X_OK);
+        return full;
       }
+    } catch {
+      // Continue scanning PATH
     }
-  } catch {}
-
-  let envType: 'android_native' | 'termux_native' | 'ubuntu_proot' | 'linux_generic' | 'unknown' = 'linux_generic';
-  let typeName = `Linux (${distro})`;
-
-  if (isTermux && !isProot) {
-    envType = 'android_native';
-    typeName = 'Native Android';
-  } else if (isProot) {
-    envType = 'ubuntu_proot';
-    typeName = 'Ubuntu (proot-distro)';
   }
-
-  const executables: Record<string, string> = {};
-  const tools = ['node', 'npm', 'git', 'pkg', 'apt-get', 'apt', 'python3', 'python', 'ffmpeg', 'curl', 'tar'];
-  for (const t of tools) {
-    const p = lookPath(t);
-    if (p) executables[t] = p;
-  }
-
-  let packageManager = 'none';
-  if (envType === 'android_native') {
-    if (executables['pkg']) packageManager = 'pkg';
-    else if (executables['apt']) packageManager = 'apt';
-  } else {
-    if (executables['apt-get']) packageManager = 'apt-get';
-    else if (executables['apt']) packageManager = 'apt';
-    else if (lookPath('pacman')) packageManager = 'pacman';
-    else if (lookPath('apk')) packageManager = 'apk';
-  }
-
-  const capabilities = [
-    'Node.js Process Lifecycle Management',
-    'Interactive Real-time Terminal via WebSocket',
-    'Git Repository Clone & Fetch',
-    'Per-server Isolated Data Directories',
-    'Automated .env.example Sync Engine',
-  ];
-  const limitations: string[] = [];
-
-  if (envType === 'android_native') {
-    capabilities.push('Native Package Management (pkg)');
-    limitations.push('Mobile battery optimization may kill background processes unless Wake Lock is acquired');
-    limitations.push('Runs with non-root sandbox permissions');
-  } else if (envType === 'ubuntu_proot') {
-    capabilities.push('Debian/Ubuntu APT Package Management', 'Full glibc compatibility');
-    limitations.push('No systemd daemon support inside proot');
-  } else {
-    capabilities.push('Full Linux Kernel & Standard Syscall Execution');
-  }
-
-  if (executables['node']) {
-    capabilities.push('Node.js Runtime Available');
-  } else {
-    limitations.push('Node.js is not found in PATH');
-  }
-
-  if (executables['git']) {
-    capabilities.push('Git Version Control Available');
-  } else {
-    limitations.push('Git is not installed; Git clone will be disabled until installed');
-  }
-
-  return {
-    type: envType,
-    type_name: typeName,
-    os: os.platform(),
-    arch: os.arch(),
-    kernel: os.release(),
-    hostname: os.hostname(),
-    distro,
-    distro_version: distroVersion,
-    prefix,
-    termux_version: termuxVersion,
-    is_proot: isProot,
-    package_manager: packageManager,
-    executables,
-    capabilities,
-    limitations,
-    disk_free_mb: 25000,
-    memory_total_mb: Math.round(os.totalmem() / (1024 * 1024)),
-  };
+  return null;
 }
 
-// --- Active Process Management ---
-interface ActiveServerProcess {
-  process: ChildProcess;
-  pid: number;
-  startTime: number;
-  logs: LogLine[];
-  logStream?: fs.WriteStream;
-  intentionalStop: boolean;
-  restartCount: number;
-}
+const versionCache = new Map<string, { version: string; expiresAt: number }>();
 
-const activeProcesses = new Map<string, ActiveServerProcess>();
-let isPackageOpBusy = false;
-let activePackageOp = '';
+function getToolVersionAsync(executablePath: string): Promise<string> {
+  const now = Date.now();
+  const cached = versionCache.get(executablePath);
+  if (cached && cached.expiresAt > now) {
+    return Promise.resolve(cached.version);
+  }
 
-// --- Active Interactive Terminal Engine ---
-interface ActiveTerminalProcess {
-  process: ChildProcess;
-  serverId: string;
-  command: string;
-  startTime: number;
-  cwd: string;
-}
-
-const activeTerminals = new Map<string, ActiveTerminalProcess>();
-const serverWorkingDirs = new Map<string, string>(); // serverId -> current working directory path
-
-// WebSocket subscribers: client -> Set of subscribed server IDs
-const wsSubscribers = new Map<WebSocket, Set<string>>();
-
-function broadcastWSEvent(event: string, data: any, filterServerId?: string) {
-  const msg = JSON.stringify({ event, data });
-  for (const [client, serverSubs] of wsSubscribers.entries()) {
-    if (client.readyState === WebSocket.OPEN) {
-      if (filterServerId) {
-        if (serverSubs.has(filterServerId)) {
-          client.send(msg);
-        }
-      } else {
-        client.send(msg);
+  return new Promise((resolve) => {
+    execFile(
+      executablePath,
+      ['--version'],
+      { timeout: 2500, maxBuffer: 64 * 1024 },
+      (err, stdout, stderr) => {
+        const raw = `${stdout || ''}\n${stderr || ''}`.trim();
+        const firstLine = raw.split('\n').map((l) => l.trim()).find(Boolean);
+        const version = !err && firstLine ? firstLine.slice(0, 120) : firstLine ? firstLine.slice(0, 120) : 'Installed';
+        versionCache.set(executablePath, { version, expiresAt: Date.now() + 60_000 });
+        resolve(version);
       }
-    }
-  }
+    );
+  });
 }
 
-function appendLog(serverId: string, stream: 'stdout' | 'stderr' | 'system', text: string) {
-  const logLine: LogLine = {
-    timestamp: new Date().toISOString(),
-    stream,
-    text,
-  };
+function runCommandAsync(
+  command: string,
+  args: string[],
+  options: { cwd?: string; env?: NodeJS.ProcessEnv; timeoutMs?: number } = {}
+): Promise<{ stdout: string; stderr: string; output: string }> {
+  const timeoutMs = options.timeoutMs ?? 180_000;
+  const maxBytes = 512 * 1024;
 
-  const ap = activeProcesses.get(serverId);
-  if (ap) {
-    ap.logs.push(logLine);
-    if (ap.logs.length > 1000) ap.logs.shift();
-    if (ap.logStream) {
-      ap.logStream.write(`[${logLine.timestamp}][${stream}] ${text}\n`);
-    }
-  }
-
-  broadcastWSEvent('log', {
-    server_id: serverId,
-    timestamp: logLine.timestamp,
-    stream: logLine.stream,
-    text: logLine.text,
-  }, serverId);
-}
-
-function updateServerStatus(serverId: string, newStatus: ServerStatus, exitCode: number) {
-  const server = store.getServer(serverId);
-  if (server) {
-    const oldStatus = server.status;
-    server.status = newStatus;
-    server.last_exit_code = exitCode;
-    store.saveServer(server);
-
-    broadcastWSEvent('status', {
-      server_id: serverId,
-      old_status: oldStatus,
-      new_status: newStatus,
-      exit_code: exitCode,
-    });
-  }
-}
-
-function getProcessMetrics(serverId: string): ServerMetrics | undefined {
-  const ap = activeProcesses.get(serverId);
-  const server = store.getServer(serverId);
-  if (!server) return undefined;
-
-  if (!ap || server.status !== 'running') {
-    return {
-      pid: 0,
-      status: server.status,
-      uptime_sec: 0,
-      memory_mb: 0,
-      cpu_percent: 0,
-    };
-  }
-
-  let memoryMb = 18.5;
-  try {
-    const statusFile = `/proc/${ap.pid}/status`;
-    if (fs.existsSync(statusFile)) {
-      const content = fs.readFileSync(statusFile, 'utf-8');
-      const match = content.match(/VmRSS:\s+(\d+)\s+kB/);
-      if (match) {
-        memoryMb = Math.round((parseInt(match[1], 10) / 1024) * 10) / 10;
-      }
-    }
-  } catch {}
-
-  return {
-    pid: ap.pid,
-    status: 'running',
-    uptime_sec: Math.floor((Date.now() - ap.startTime) / 1000),
-    memory_mb: memoryMb,
-    cpu_percent: 0.1,
-  };
-}
-
-function safeResolveServerPath(serverId: string, subPath: string = ''): string {
-  const root = path.resolve(SERVERS_DIR, serverId);
-  const target = path.resolve(root, subPath.replace(/^\/+/, ''));
-  if (!target.startsWith(root)) {
-    throw new Error('Access denied: directory traversal outside server root detected');
-  }
-  return target;
-}
-
-function getServerWorkingDir(serverId: string): string {
-  const root = path.resolve(SERVERS_DIR, serverId);
-  if (!fs.existsSync(root)) {
-    fs.mkdirSync(root, { recursive: true });
-  }
-  const current = serverWorkingDirs.get(serverId);
-  if (current && current.startsWith(root) && fs.existsSync(current)) {
-    return current;
-  }
-  serverWorkingDirs.set(serverId, root);
-  return root;
-}
-
-function startServerProcess(serverId: string): Promise<void> {
   return new Promise((resolve, reject) => {
-    const server = store.getServer(serverId);
-    if (!server) return reject(new Error('Server not found'));
+    let stdout = '';
+    let stderr = '';
+    let settled = false;
 
-    if (activeProcesses.has(serverId)) {
-      const existing = activeProcesses.get(serverId);
-      if (existing && !existing.process.killed) {
-        return reject(new Error('Process is already running'));
-      }
-    }
+    const child = spawn(command, args, {
+      cwd: options.cwd,
+      env: options.env ?? process.env,
+      shell: false,
+      stdio: ['ignore', 'pipe', 'pipe'],
+    });
 
-    const srvDir = path.join(SERVERS_DIR, serverId);
-    if (!fs.existsSync(srvDir)) {
-      fs.mkdirSync(srvDir, { recursive: true });
-    }
-
-    const logDir = path.join(srvDir, 'logs');
-    fs.mkdirSync(logDir, { recursive: true });
-    const logFilePath = path.join(logDir, 'server.log');
-    const logStream = fs.createWriteStream(logFilePath, { flags: 'a' });
-
-    updateServerStatus(serverId, 'starting', 0);
-
-    const entry = (server.entry_file || 'index.js').trim();
-    let cmd = 'node';
-    let args: string[] = [entry];
-
-    if (entry.startsWith('npm run ')) {
-      cmd = 'npm';
-      args = ['run', entry.replace('npm run ', '').trim()];
-    } else if (entry === 'npm start') {
-      cmd = 'npm';
-      args = ['start'];
-    } else {
-      const entryPath = path.join(srvDir, entry);
-      if (!fs.existsSync(entryPath)) {
-        seedServerTemplate(srvDir, 'express_api', server.name, server.port || 3400);
-        appendLog(serverId, 'system', `[nodepanel] Notice: Entry file '${entry}' was missing. Re-created default server template.`);
-      }
-    }
-
-    // Read variables from server.env_vars and from .env file
-    const envVarsFromFile: Record<string, string> = {};
-    const envPath = path.join(srvDir, '.env');
-    if (fs.existsSync(envPath)) {
+    const timer = setTimeout(() => {
+      if (settled) return;
+      settled = true;
       try {
-        const envContent = fs.readFileSync(envPath, 'utf-8');
-        for (const line of envContent.split('\n')) {
-          const trimmed = line.trim();
-          if (!trimmed || trimmed.startsWith('#')) continue;
-          const eqIdx = trimmed.indexOf('=');
-          if (eqIdx > 0) {
-            const k = trimmed.substring(0, eqIdx).trim();
-            let v = trimmed.substring(eqIdx + 1).trim();
-            if ((v.startsWith('"') && v.endsWith('"')) || (v.startsWith("'") && v.endsWith("'"))) {
-              v = v.substring(1, v.length - 1);
-            }
-            envVarsFromFile[k] = v;
-          }
-        }
-      } catch {}
-    }
+        child.kill('SIGKILL');
+      } catch {
+        // Ignore
+      }
+      reject(new HttpError(408, 'COMMAND_TIMEOUT', `Command '${command}' timed out after ${Math.round(timeoutMs / 1000)}s`));
+    }, timeoutMs);
 
-    const customEnv: NodeJS.ProcessEnv = {
-      ...process.env,
-      ...server.env_vars,
-      ...envVarsFromFile,
-      PORT: String(server.port || 3400),
-      NODE_ENV: envVarsFromFile.NODE_ENV || server.env_vars?.NODE_ENV || 'production',
-    };
-
-    let child: ChildProcess;
-    try {
-      child = spawn(cmd, args, {
-        cwd: srvDir,
-        env: customEnv,
-        stdio: ['pipe', 'pipe', 'pipe'],
-      });
-    } catch (err: any) {
-      updateServerStatus(serverId, 'failed', -1);
-      return reject(err);
-    }
-
-    const ap: ActiveServerProcess = {
-      process: child,
-      pid: child.pid || 0,
-      startTime: Date.now(),
-      logs: [],
-      logStream,
-      intentionalStop: false,
-      restartCount: 0,
-    };
-    activeProcesses.set(serverId, ap);
-
-    updateServerStatus(serverId, 'running', 0);
-    appendLog(serverId, 'system', `[nodepanel] Process started (PID: ${ap.pid}) using "${cmd} ${args.join(' ')}"`);
-    store.recordActivity('start_server', serverId, `Server '${server.name}' started (PID: ${ap.pid})`, 'success');
-
-    child.stdout?.on('data', (data) => {
-      const lines = data.toString('utf-8').split('\n');
-      for (const line of lines) {
-        if (line.trim().length > 0) appendLog(serverId, 'stdout', line);
+    child.stdout?.on('data', (chunk: Buffer) => {
+      if (stdout.length < maxBytes) {
+        stdout += chunk.toString('utf-8');
       }
     });
 
-    child.stderr?.on('data', (data) => {
-      const lines = data.toString('utf-8').split('\n');
-      for (const line of lines) {
-        if (line.trim().length > 0) appendLog(serverId, 'stderr', line);
-      }
-    });
-
-    child.on('exit', (code, signal) => {
-      const exitCode = code !== null ? code : 1;
-      const wasIntentional = ap.intentionalStop;
-      logStream.end();
-      activeProcesses.delete(serverId);
-
-      let finalStatus: ServerStatus = 'stopped';
-      if (wasIntentional) {
-        finalStatus = 'stopped';
-        appendLog(serverId, 'system', `[nodepanel] Process stopped gracefully with code ${exitCode}`);
-      } else if (exitCode === 0) {
-        finalStatus = 'stopped';
-        appendLog(serverId, 'system', `[nodepanel] Process completed cleanly with code 0`);
-      } else {
-        finalStatus = 'crashed';
-        appendLog(serverId, 'system', `[nodepanel] Process crashed with exit code ${exitCode} (${signal || ''})`);
-      }
-
-      updateServerStatus(serverId, finalStatus, exitCode);
-
-      // Auto-restart handling
-      if (!wasIntentional) {
-        const s = store.getServer(serverId);
-        if (s) {
-          const shouldRestart =
-            s.auto_restart === 'always' || (s.auto_restart === 'on-failure' && exitCode !== 0);
-          if (shouldRestart) {
-            ap.restartCount++;
-            if (ap.restartCount <= 5) {
-              const backoffMs = ap.restartCount * 2000;
-              appendLog(serverId, 'system', `[nodepanel] Auto-restarting in ${backoffMs / 1000}s (attempt ${ap.restartCount}/5)...`);
-              setTimeout(() => {
-                startServerProcess(serverId).catch(() => {});
-              }, backoffMs);
-            } else {
-              appendLog(serverId, 'system', `[nodepanel] Maximum auto-restart attempts reached (5). Halting.`);
-            }
-          }
-        }
-      }
-    });
-
-    resolve();
-  });
-}
-
-function stopServerProcess(serverId: string): Promise<void> {
-  return new Promise((resolve, reject) => {
-    const ap = activeProcesses.get(serverId);
-    if (!ap) {
-      updateServerStatus(serverId, 'stopped', 0);
-      return resolve();
-    }
-
-    ap.intentionalStop = true;
-    updateServerStatus(serverId, 'stopping', 0);
-    appendLog(serverId, 'system', '[nodepanel] Stopping process...');
-
-    let resolved = false;
-    const forceKillTimer = setTimeout(() => {
-      if (!resolved) {
-        try {
-          ap.process.kill('SIGKILL');
-          appendLog(serverId, 'system', '[nodepanel] Sent SIGKILL after graceful timeout.');
-        } catch {}
-        resolved = true;
-        resolve();
-      }
-    }, 3000);
-
-    ap.process.once('exit', () => {
-      clearTimeout(forceKillTimer);
-      if (!resolved) {
-        resolved = true;
-        resolve();
-      }
-    });
-
-    try {
-      ap.process.kill('SIGTERM');
-    } catch (err) {
-      clearTimeout(forceKillTimer);
-      return reject(err);
-    }
-  });
-}
-
-// --- Terminal Command Runner ---
-function executeTerminalCommand(serverId: string, commandText: string) {
-  const trimmed = commandText.trim();
-  if (!trimmed) return;
-
-  const server = store.getServer(serverId);
-  if (!server) {
-    broadcastWSEvent('terminal_data', {
-      serverId,
-      stream: 'system',
-      text: `[nodepanel-term] Error: Server ${serverId} not found.`,
-    }, serverId);
-    return;
-  }
-
-  const serverRoot = path.resolve(SERVERS_DIR, serverId);
-  let currentCwd = getServerWorkingDir(serverId);
-
-  // Broadcast command echo
-  const relCwdDisplay = path.relative(serverRoot, currentCwd) || '.';
-  broadcastWSEvent('terminal_data', {
-    serverId,
-    stream: 'command',
-    text: `$ ${trimmed}`,
-    cwd: relCwdDisplay,
-  }, serverId);
-
-  // Handle cd built-in safely
-  if (trimmed === 'cd' || trimmed.startsWith('cd ')) {
-    const targetArg = trimmed === 'cd' ? '' : trimmed.substring(3).trim();
-    let newPath = serverRoot;
-    if (targetArg && targetArg !== '~') {
-      newPath = path.resolve(currentCwd, targetArg);
-    }
-
-    // Security check: cannot navigate outside serverRoot!
-    if (!newPath.startsWith(serverRoot)) {
-      broadcastWSEvent('terminal_data', {
-        serverId,
-        stream: 'stderr',
-        text: `cd: restricted to server directory (${relCwdDisplay})`,
-      }, serverId);
-      broadcastWSEvent('terminal_exit', {
-        serverId,
-        exitCode: 1,
-        cwd: relCwdDisplay,
-      }, serverId);
-      return;
-    }
-
-    if (!fs.existsSync(newPath) || !fs.statSync(newPath).isDirectory()) {
-      broadcastWSEvent('terminal_data', {
-        serverId,
-        stream: 'stderr',
-        text: `cd: no such file or directory: ${targetArg}`,
-      }, serverId);
-      broadcastWSEvent('terminal_exit', {
-        serverId,
-        exitCode: 1,
-        cwd: relCwdDisplay,
-      }, serverId);
-      return;
-    }
-
-    serverWorkingDirs.set(serverId, newPath);
-    const updatedRel = path.relative(serverRoot, newPath) || '.';
-    broadcastWSEvent('terminal_data', {
-      serverId,
-      stream: 'system',
-      text: `Directory changed to: /${updatedRel === '.' ? '' : updatedRel}`,
-    }, serverId);
-    broadcastWSEvent('terminal_exit', {
-      serverId,
-      exitCode: 0,
-      cwd: updatedRel,
-    }, serverId);
-    return;
-  }
-
-  // Handle clear built-in
-  if (trimmed === 'clear') {
-    broadcastWSEvent('terminal_clear', { serverId }, serverId);
-    broadcastWSEvent('terminal_exit', {
-      serverId,
-      exitCode: 0,
-      cwd: relCwdDisplay,
-    }, serverId);
-    return;
-  }
-
-  // Check if a terminal command is already running for this server
-  const existing = activeTerminals.get(serverId);
-  if (existing) {
-    broadcastWSEvent('terminal_data', {
-      serverId,
-      stream: 'system',
-      text: `[nodepanel-term] Warning: A process is already running (${existing.command}). Terminating previous process...`,
-    }, serverId);
-    try {
-      existing.process.kill('SIGINT');
-    } catch {}
-  }
-
-  // Spawn shell process
-  try {
-    const child = spawn(trimmed, {
-      shell: true,
-      cwd: currentCwd,
-      env: {
-        ...process.env,
-        ...server.env_vars,
-        PORT: String(server.port || 3400),
-      },
-      stdio: ['pipe', 'pipe', 'pipe'],
-    });
-
-    const termSession: ActiveTerminalProcess = {
-      process: child,
-      serverId,
-      command: trimmed,
-      startTime: Date.now(),
-      cwd: currentCwd,
-    };
-    activeTerminals.set(serverId, termSession);
-
-    broadcastWSEvent('terminal_start', {
-      serverId,
-      command: trimmed,
-      pid: child.pid,
-      cwd: relCwdDisplay,
-    }, serverId);
-
-    child.stdout?.on('data', (chunk) => {
-      const lines = chunk.toString('utf-8').split('\n');
-      for (const line of lines) {
-        if (line.length > 0) {
-          broadcastWSEvent('terminal_data', {
-            serverId,
-            stream: 'stdout',
-            text: line,
-          }, serverId);
-        }
-      }
-    });
-
-    child.stderr?.on('data', (chunk) => {
-      const lines = chunk.toString('utf-8').split('\n');
-      for (const line of lines) {
-        if (line.length > 0) {
-          broadcastWSEvent('terminal_data', {
-            serverId,
-            stream: 'stderr',
-            text: line,
-          }, serverId);
-        }
+    child.stderr?.on('data', (chunk: Buffer) => {
+      if (stderr.length < maxBytes) {
+        stderr += chunk.toString('utf-8');
       }
     });
 
     child.on('error', (err) => {
-      broadcastWSEvent('terminal_data', {
-        serverId,
-        stream: 'stderr',
-        text: `[nodepanel-term] Spawn error: ${err.message}`,
-      }, serverId);
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      reject(new HttpError(500, 'COMMAND_SPAWN_ERROR', `Failed to execute '${command}': ${err.message}`));
     });
 
-    child.on('exit', (code, signal) => {
-      activeTerminals.delete(serverId);
-      const exitCode = code !== null ? code : (signal ? 130 : 0);
-      const durationMs = Date.now() - termSession.startTime;
-      broadcastWSEvent('terminal_data', {
-        serverId,
-        stream: 'system',
-        text: `[process exited with code ${exitCode}${signal ? ` (${signal})` : ''} in ${(durationMs / 1000).toFixed(1)}s]`,
-      }, serverId);
-
-      broadcastWSEvent('terminal_exit', {
-        serverId,
-        exitCode,
-        signal,
-        cwd: relCwdDisplay,
-      }, serverId);
+    child.on('close', (code) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      const combined = [stdout.trim(), stderr.trim()].filter(Boolean).join('\n');
+      if (code === 0) {
+        resolve({ stdout, stderr, output: combined });
+      } else {
+        const err = new HttpError(
+          400,
+          'COMMAND_FAILED',
+          combined ? combined.split('\n').slice(-4).join(' | ').slice(0, 320) : `${command} exited with code ${code}`
+        );
+        (err as HttpError & { output?: string }).output = combined;
+        reject(err);
+      }
     });
-  } catch (err: any) {
-    broadcastWSEvent('terminal_data', {
-      serverId,
-      stream: 'stderr',
-      text: `[nodepanel-term] Failed to start command: ${err.message}`,
-    }, serverId);
-    broadcastWSEvent('terminal_exit', {
-      serverId,
-      exitCode: 1,
-      cwd: relCwdDisplay,
-    }, serverId);
+  });
+}
+
+function getRealDiskFreeMb(targetDir: string): number | null {
+  try {
+    if (typeof fs.statfsSync === 'function') {
+      const stats = fs.statfsSync(targetDir);
+      const freeBytes = Number(stats.bavail) * Number(stats.bsize);
+      if (Number.isFinite(freeBytes) && freeBytes >= 0) {
+        return Math.round(freeBytes / (1024 * 1024));
+      }
+    }
+  } catch {
+    // Fallback to null when statfs is unavailable
+  }
+  return null;
+}
+
+function killProcessTree(child: ChildProcess, signal: NodeJS.Signals): void {
+  const pid = child.pid;
+  if (typeof pid === 'number' && pid > 0) {
+    if (process.platform !== 'win32') {
+      try {
+        process.kill(-pid, signal);
+        return;
+      } catch {
+        // Fallback to direct child signal if not a process group leader or already exited
+      }
+    }
+    try {
+      child.kill(signal);
+    } catch {
+      // Process already exited
+    }
   }
 }
 
-function killTerminalCommand(serverId: string) {
-  const session = activeTerminals.get(serverId);
-  if (!session) return;
-
-  broadcastWSEvent('terminal_data', {
-    serverId,
-    stream: 'system',
-    text: `^C [nodepanel-term] Sending SIGINT to process...`,
-  }, serverId);
-
+function readProcMemoryMb(pid: number): number | null {
+  if (!pid || pid <= 0) return null;
   try {
-    session.process.kill('SIGINT');
-  } catch {}
-
-  setTimeout(() => {
-    if (activeTerminals.has(serverId)) {
-      try {
-        session.process.kill('SIGKILL');
-      } catch {}
+    const statusFile = `/proc/${pid}/status`;
+    if (!fs.existsSync(statusFile)) return null;
+    const content = fs.readFileSync(statusFile, 'utf-8');
+    const match = content.match(/VmRSS:\s+(\d+)\s+kB/);
+    if (match) {
+      return Math.round((parseInt(match[1], 10) / 1024) * 10) / 10;
     }
-  }, 1500);
+  } catch {
+    // Process exited or /proc not mounted
+  }
+  return null;
 }
 
-function seedServerTemplate(dir: string, template: string = 'blank', name: string, port: number) {
-  const cleanName = name.toLowerCase().replace(/[^a-z0-9_-]/g, '-');
+function readProcCpuTicks(pid: number): number | null {
+  if (!pid || pid <= 0) return null;
+  try {
+    const statPath = `/proc/${pid}/stat`;
+    if (!fs.existsSync(statPath)) return null;
+    const raw = fs.readFileSync(statPath, 'utf-8');
+    const closeParen = raw.lastIndexOf(')');
+    if (closeParen === -1) return null;
+    const fields = raw.slice(closeParen + 2).trim().split(/\s+/);
+    // utime is field 14 (index 11 after ')'), stime is field 15 (index 12 after ')')
+    const utime = Number(fields[11]);
+    const stime = Number(fields[12]);
+    if (Number.isFinite(utime) && Number.isFinite(stime)) {
+      return utime + stime;
+    }
+  } catch {
+    // Process exited or /proc not mounted
+  }
+  return null;
+}
+
+function isOriginAllowed(origin: string | undefined, hostHeader: string | undefined): boolean {
+  if (!origin) return true;
+  let parsed: URL;
+  try {
+    parsed = new URL(origin);
+  } catch {
+    return false;
+  }
+
+  const hostOnly = (hostHeader || '').split(',')[0].trim();
+  if (hostOnly && parsed.host === hostOnly) {
+    return true;
+  }
+
+  const hostname = parsed.hostname.toLowerCase();
+  if (hostname === 'localhost' || hostname === '127.0.0.1' || hostname === '[::1]') {
+    return true;
+  }
+
+  if (
+    hostname.endsWith('.run.app') ||
+    hostname.endsWith('.googleusercontent.com') ||
+    hostname.endsWith('.google.com')
+  ) {
+    return true;
+  }
+
+  const extraOrigins = (process.env.ALLOWED_ORIGINS || '')
+    .split(',')
+    .map((s) => s.trim())
+    .filter(Boolean);
+  if (extraOrigins.includes(origin)) {
+    return true;
+  }
+
+  return false;
+}
+
+function seedServerTemplate(dir: string, template = 'blank', name: string, port: number): void {
+  const cleanName = name.toLowerCase().replace(/[^a-z0-9_-]/g, '-') || 'node-app';
+  const safeDisplayName = name.replace(/[\r\n]/g, ' ').trim();
+
   switch (template) {
     case 'express_api': {
       const pkg = {
         name: cleanName,
         version: '1.0.0',
-        description: `Express REST API managed by Termux NodePanel`,
+        description: 'Express REST API managed by Termux NodePanel',
         main: 'index.js',
         scripts: { start: 'node index.js' },
         dependencies: { express: '^4.21.2' },
@@ -973,27 +576,28 @@ const PORT = process.env.PORT || ${port};
 
 app.use(express.json());
 
-app.get('/', (req, res) => {
+app.get('/', (_req, res) => {
   res.json({
     status: 'online',
-    app: ${JSON.stringify(name)},
+    app: ${JSON.stringify(safeDisplayName)},
     environment: process.env.NODE_ENV || 'development',
     time: new Date().toISOString()
   });
 });
 
-app.get('/api/ping', (req, res) => {
+app.get('/api/ping', (_req, res) => {
   res.json({ pong: true, timestamp: Date.now() });
 });
 
-app.listen(PORT, '0.0.0.0', () => {
-  console.log('[${name}] Express Server listening on http://localhost:' + PORT);
+const server = app.listen(PORT, '0.0.0.0', () => {
+  console.log(${JSON.stringify(`[${safeDisplayName}] Express Server listening on http://localhost:`)} + PORT);
+});
+
+process.on('SIGTERM', () => {
+  server.close(() => process.exit(0));
 });
 `;
-      const envExample = `# Server Configuration
-PORT=${port}
-NODE_ENV=production
-`;
+      const envExample = `# Server Configuration\nPORT=${port}\nNODE_ENV=production\n`;
       fs.writeFileSync(path.join(dir, 'package.json'), JSON.stringify(pkg, null, 2));
       fs.writeFileSync(path.join(dir, 'index.js'), code);
       fs.writeFileSync(path.join(dir, '.env.example'), envExample);
@@ -1008,7 +612,7 @@ NODE_ENV=production
         main: 'index.js',
         scripts: { start: 'node index.js' },
       };
-      const code = `console.log('[${name}] Worker initialized. Starting periodic processing...');
+      const code = `console.log(${JSON.stringify(`[${safeDisplayName}] Worker initialized. Starting periodic processing...`)});
 
 let counter = 0;
 const interval = setInterval(() => {
@@ -1017,15 +621,12 @@ const interval = setInterval(() => {
 }, 3000);
 
 process.on('SIGTERM', () => {
-  console.log('[${name}] Received SIGTERM signal. Performing cleanup...');
+  console.log(${JSON.stringify(`[${safeDisplayName}] Received SIGTERM signal. Performing cleanup...`)});
   clearInterval(interval);
   process.exit(0);
 });
 `;
-      const envExample = `# Worker Configuration
-WORKER_INTERVAL_MS=3000
-NODE_ENV=production
-`;
+      const envExample = `# Worker Configuration\nWORKER_INTERVAL_MS=3000\nNODE_ENV=production\n`;
       fs.writeFileSync(path.join(dir, 'package.json'), JSON.stringify(pkg, null, 2));
       fs.writeFileSync(path.join(dir, 'index.js'), code);
       fs.writeFileSync(path.join(dir, '.env.example'), envExample);
@@ -1043,19 +644,20 @@ NODE_ENV=production
       const code = `const http = require('http');
 const PORT = process.env.PORT || ${port};
 
-const server = http.createServer((req, res) => {
+const server = http.createServer((_req, res) => {
   res.writeHead(200, { 'Content-Type': 'application/json' });
-  res.end(JSON.stringify({ message: 'Hello from ${name}!', time: new Date() }));
+  res.end(JSON.stringify({ message: ${JSON.stringify(`Hello from ${safeDisplayName}!`)}, time: new Date() }));
 });
 
 server.listen(PORT, '0.0.0.0', () => {
-  console.log('[${name}] HTTP server running on port ' + PORT);
+  console.log(${JSON.stringify(`[${safeDisplayName}] HTTP server running on port `)} + PORT);
+});
+
+process.on('SIGTERM', () => {
+  server.close(() => process.exit(0));
 });
 `;
-      const envExample = `# Server Configuration
-PORT=${port}
-NODE_ENV=development
-`;
+      const envExample = `# Server Configuration\nPORT=${port}\nNODE_ENV=development\n`;
       fs.writeFileSync(path.join(dir, 'package.json'), JSON.stringify(pkg, null, 2));
       fs.writeFileSync(path.join(dir, 'index.js'), code);
       fs.writeFileSync(path.join(dir, '.env.example'), envExample);
@@ -1065,31 +667,1193 @@ NODE_ENV=development
   }
 }
 
-function findAvailablePort(startPort: number = 3001): number {
-  const used = new Set<number>();
-  for (const s of store.listServers()) {
-    if (s.port) used.add(s.port);
-  }
-  let p = startPort;
-  while (used.has(p) || p === 3000) {
-    p++;
-  }
-  return p;
+function autoRestartPolicyValid(val: unknown): val is AutoRestartPolicy {
+  return val === 'never' || val === 'always' || val === 'on-failure';
 }
 
-// --- Main Server Setup ---
-async function main() {
-  const app = express();
-  app.use(express.json());
+export async function createPanelServer(options: PanelServerOptions = {}): Promise<PanelServerInstance> {
+  const configuredPort = options.port ?? (Number(process.env.PORT) || 3000);
+  const host = options.host ?? '0.0.0.0';
+  const isProd = options.isProd ?? process.env.NODE_ENV === 'production';
+  const enableVite = options.enableVite ?? !isProd;
+  const serveStatic = options.serveStatic ?? isProd;
+  const apiSecretKey = (options.apiSecretKey ?? process.env.API_SECRET_KEY ?? '').trim();
+  const rateLimitMax = options.rateLimitMax ?? (Number(process.env.NODEPANEL_RATE_LIMIT_MAX) || 1200);
+  const autoRestartBaseMs = options.autoRestartBaseMs ?? 2000;
+  const maxAutoRestarts = options.maxAutoRestarts ?? 5;
+  const stopGraceTimeoutMs = options.stopGraceTimeoutMs ?? 3000;
 
-  // CORS headers
-  app.use((req, res, next) => {
-    res.setHeader('Access-Control-Allow-Origin', '*');
-    res.setHeader('Access-Control-Allow-Methods', 'GET, POST, PUT, DELETE, OPTIONS');
-    res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization, X-Requested-With');
-    if (req.method === 'OPTIONS') {
-      return res.sendStatus(200);
+  const dataDir = path.resolve(
+    options.dataDir || process.env.NODEPANEL_DATA_DIR || path.join(__dirname, 'data')
+  );
+  const serversDir = path.join(dataDir, 'servers');
+  const dbJsonPath = path.join(dataDir, 'nodepanel.json');
+
+  fs.mkdirSync(serversDir, { recursive: true });
+
+  const store = new JsonStore(dbJsonPath);
+
+  interface ActiveServerProcess {
+    process: ChildProcess;
+    pid: number;
+    startTime: number;
+    logs: LogLine[];
+    logStream?: fs.WriteStream;
+    intentionalStop: boolean;
+    lastCpuSample?: { ticks: number; timestampMs: number };
+  }
+
+  interface SupervisorState {
+    restartCount: number;
+    restartTimer: NodeJS.Timeout | null;
+    stableTimer: NodeJS.Timeout | null;
+  }
+
+  interface ActiveTerminalProcess {
+    process: ChildProcess;
+    serverId: string;
+    command: string;
+    startTime: number;
+    cwd: string;
+  }
+
+  interface WsClientMeta {
+    subscriptions: Set<string>;
+    isAlive: boolean;
+    seenRequestIds: string[];
+  }
+
+  const activeProcesses = new Map<string, ActiveServerProcess>();
+  const supervisorStates = new Map<string, SupervisorState>();
+  const serverLocks = new Map<string, Promise<void>>();
+  const activeTerminals = new Map<string, ActiveTerminalProcess>();
+  const serverWorkingDirs = new Map<string, string>();
+  const wsClients = new Map<WebSocket, WsClientMeta>();
+  const rateBuckets = new Map<string, { count: number; resetAt: number }>();
+
+  let isShuttingDown = false;
+  let isPackageOpBusy = false;
+  let activePackageOp = '';
+  let boundPort = configuredPort;
+
+  function getSupervisorState(serverId: string): SupervisorState {
+    let state = supervisorStates.get(serverId);
+    if (!state) {
+      state = { restartCount: 0, restartTimer: null, stableTimer: null };
+      supervisorStates.set(serverId, state);
     }
+    return state;
+  }
+
+  function clearSupervisorTimers(serverId: string, resetCount = true): void {
+    const state = supervisorStates.get(serverId);
+    if (!state) return;
+    if (state.restartTimer) {
+      clearTimeout(state.restartTimer);
+      state.restartTimer = null;
+    }
+    if (state.stableTimer) {
+      clearTimeout(state.stableTimer);
+      state.stableTimer = null;
+    }
+    if (resetCount) {
+      state.restartCount = 0;
+    }
+  }
+
+  function withServerLock<T>(serverId: string, task: () => Promise<T>): Promise<T> {
+    const prev = serverLocks.get(serverId) ?? Promise.resolve();
+    let releaseLock!: () => void;
+    const nextGate = new Promise<void>((resolve) => {
+      releaseLock = resolve;
+    });
+    serverLocks.set(
+      serverId,
+      prev.then(
+        () => nextGate,
+        () => nextGate
+      )
+    );
+
+    return prev.then(task).finally(() => {
+      releaseLock();
+      if (serverLocks.get(serverId) === nextGate) {
+        serverLocks.delete(serverId);
+      }
+    });
+  }
+
+  function assertValidServerId(serverId: string): void {
+    if (!serverId || typeof serverId !== 'string' || !SERVER_ID_REGEX.test(serverId)) {
+      throw new HttpError(400, 'INVALID_SERVER_ID', 'Invalid server identifier');
+    }
+  }
+
+  function safeResolveServerPath(serverId: string, subPath = ''): string {
+    assertValidServerId(serverId);
+    if (typeof subPath !== 'string' || subPath.includes('\0')) {
+      throw new HttpError(400, 'INVALID_PATH', 'Invalid file path');
+    }
+
+    const baseServersDir = fs.existsSync(serversDir) ? fs.realpathSync(serversDir) : path.resolve(serversDir);
+    const rawRoot = path.join(baseServersDir, serverId);
+    const realRoot = fs.existsSync(rawRoot) ? fs.realpathSync(rawRoot) : rawRoot;
+
+    if (realRoot !== rawRoot && !realRoot.startsWith(baseServersDir + path.sep)) {
+      throw new HttpError(403, 'PATH_TRAVERSAL', 'Access denied: server root symlink violation');
+    }
+
+    const cleanSub = subPath.replace(/^[\\/]+/, '');
+    const resolvedTarget = path.resolve(realRoot, cleanSub);
+
+    if (resolvedTarget !== realRoot && !resolvedTarget.startsWith(realRoot + path.sep)) {
+      throw new HttpError(
+        403,
+        'PATH_TRAVERSAL',
+        'Access denied: directory traversal outside server root detected'
+      );
+    }
+
+    // Walk up to nearest existing ancestor and verify realpath stays inside realRoot
+    let probe = resolvedTarget;
+    while (!fs.existsSync(probe)) {
+      const parent = path.dirname(probe);
+      if (parent === probe) break;
+      probe = parent;
+    }
+
+    if (fs.existsSync(probe) && fs.existsSync(realRoot)) {
+      const realProbe = fs.realpathSync(probe);
+      if (realProbe !== realRoot && !realProbe.startsWith(realRoot + path.sep)) {
+        throw new HttpError(
+          403,
+          'SYMLINK_ESCAPE',
+          'Access denied: symbolic link points outside server workspace'
+        );
+      }
+    }
+
+    return resolvedTarget;
+  }
+
+  function validateEntryCommand(serverId: string, rawEntry: string): { cmd: string; args: string[]; cleanEntry: string } {
+    const cleanEntry = (rawEntry || 'index.js').trim();
+    if (!cleanEntry || cleanEntry.length > 180 || cleanEntry.includes('\0')) {
+      throw new HttpError(400, 'INVALID_ENTRY', 'Entry point must be between 1 and 180 characters');
+    }
+    if (cleanEntry === 'npm start') {
+      return { cmd: 'npm', args: ['start'], cleanEntry };
+    }
+    if (cleanEntry.startsWith('npm run ')) {
+      const scriptName = cleanEntry.slice('npm run '.length).trim();
+      if (!SAFE_SCRIPT_NAME_REGEX.test(scriptName)) {
+        throw new HttpError(400, 'INVALID_NPM_SCRIPT', 'Invalid npm script name');
+      }
+      return { cmd: 'npm', args: ['run', scriptName], cleanEntry: `npm run ${scriptName}` };
+    }
+    if (cleanEntry.startsWith('-') || path.isAbsolute(cleanEntry)) {
+      throw new HttpError(400, 'INVALID_ENTRY', 'Entry file must be a relative path inside the server directory');
+    }
+    // Verify containment inside server root
+    safeResolveServerPath(serverId, cleanEntry);
+    return { cmd: 'node', args: [cleanEntry], cleanEntry };
+  }
+
+  let cachedStaticEnv: {
+    envType: 'android_native' | 'termux_native' | 'ubuntu_proot' | 'linux_generic' | 'unknown';
+    typeName: string;
+    distro: string;
+    distroVersion: string;
+    prefix: string;
+    termuxVersion: string;
+    isProot: boolean;
+    executables: Record<string, string>;
+    packageManager: string;
+    expiresAt: number;
+  } | null = null;
+
+  let cachedDiskFree: { value: number | null; expiresAt: number } | null = null;
+
+  function detectEnvironment() {
+    const now = Date.now();
+    if (!cachedStaticEnv || cachedStaticEnv.expiresAt < now) {
+      const prefix = process.env.PREFIX || '';
+      const termuxVersion = process.env.TERMUX_VERSION || '';
+      const isTermux =
+        prefix.includes('com.termux') ||
+        Boolean(termuxVersion) ||
+        fs.existsSync('/data/data/com.termux/files/usr/bin');
+
+      let isProot =
+        Boolean(process.env.PROOT_TMP_DIR) ||
+        Boolean(process.env.PROOT_FORCE_KILL_SIGNALS) ||
+        fs.existsSync('/proot');
+
+      try {
+        if (fs.existsSync('/etc/issue')) {
+          const issue = fs.readFileSync('/etc/issue', 'utf-8').toLowerCase();
+          if (issue.includes('proot')) isProot = true;
+        }
+      } catch {
+        // Ignore
+      }
+
+      let distro = 'Linux';
+      let distroVersion = '';
+      try {
+        if (fs.existsSync('/etc/os-release')) {
+          const osRelease = fs.readFileSync('/etc/os-release', 'utf-8');
+          for (const line of osRelease.split('\n')) {
+            if (line.startsWith('PRETTY_NAME=')) {
+              distro = line.replace('PRETTY_NAME=', '').replace(/"/g, '').trim();
+            } else if (line.startsWith('VERSION_ID=')) {
+              distroVersion = line.replace('VERSION_ID=', '').replace(/"/g, '').trim();
+            }
+          }
+        }
+      } catch {
+        // Ignore
+      }
+
+      let envType: 'android_native' | 'termux_native' | 'ubuntu_proot' | 'linux_generic' | 'unknown' =
+        'linux_generic';
+      let typeName = `Linux (${distro})`;
+
+      if (isTermux && !isProot) {
+        envType = 'android_native';
+        typeName = 'Native Android (Termux)';
+      } else if (isProot) {
+        envType = 'ubuntu_proot';
+        typeName = 'Ubuntu (proot-distro)';
+      }
+
+      const executables: Record<string, string> = {};
+      const tools = ['node', 'npm', 'git', 'pkg', 'apt-get', 'apt', 'python3', 'python', 'ffmpeg', 'curl', 'tar'];
+      for (const t of tools) {
+        const p = lookPathFast(t);
+        if (p) executables[t] = p;
+      }
+
+      let packageManager = 'none';
+      if (envType === 'android_native') {
+        if (executables['pkg']) packageManager = 'pkg';
+        else if (executables['apt']) packageManager = 'apt';
+      } else {
+        if (executables['apt-get']) packageManager = 'apt-get';
+        else if (executables['apt']) packageManager = 'apt';
+        else if (lookPathFast('pacman')) packageManager = 'pacman';
+        else if (lookPathFast('apk')) packageManager = 'apk';
+      }
+
+      cachedStaticEnv = {
+        envType,
+        typeName,
+        distro,
+        distroVersion,
+        prefix,
+        termuxVersion,
+        isProot,
+        executables,
+        packageManager,
+        expiresAt: now + 30_000,
+      };
+    }
+
+    if (!cachedDiskFree || cachedDiskFree.expiresAt < now) {
+      cachedDiskFree = {
+        value: getRealDiskFreeMb(dataDir),
+        expiresAt: now + 5_000,
+      };
+    }
+
+    const { executables, packageManager } = cachedStaticEnv;
+
+    const capabilities = [
+      'Node.js Process Supervision & Process-Group Cleanup',
+      'Interactive Real-time Terminal via WebSocket',
+      'Git Repository Clone & Dependency Installer',
+      'Per-server Sandboxed Data Directories',
+      'Automated .env.example Sync Engine',
+    ];
+    const limitations: string[] = [];
+
+    if (cachedStaticEnv.envType === 'android_native') {
+      capabilities.push('Native Package Management (pkg)');
+      limitations.push(
+        'Mobile battery optimization may suspend background processes unless Termux Wake Lock is active'
+      );
+      limitations.push('Runs within non-root Android user sandbox');
+    } else if (cachedStaticEnv.envType === 'ubuntu_proot') {
+      capabilities.push('Debian/Ubuntu APT Package Management', 'Full glibc compatibility');
+      limitations.push('No systemd daemon supervision inside proot container');
+    } else {
+      capabilities.push('Full Linux Kernel & POSIX Process Group Execution');
+    }
+
+    if (executables['node']) {
+      capabilities.push(`Node.js Runtime (${process.version})`);
+    } else {
+      limitations.push('Node.js binary not detected in PATH');
+    }
+
+    if (executables['git']) {
+      capabilities.push('Git Version Control Available');
+    } else {
+      limitations.push('Git is not installed; repository cloning requires installing git first');
+    }
+
+    return {
+      type: cachedStaticEnv.envType,
+      type_name: cachedStaticEnv.typeName,
+      os: os.platform(),
+      arch: os.arch(),
+      kernel: os.release(),
+      hostname: os.hostname(),
+      distro: cachedStaticEnv.distro,
+      distro_version: cachedStaticEnv.distroVersion,
+      prefix: cachedStaticEnv.prefix,
+      termux_version: cachedStaticEnv.termuxVersion,
+      is_proot: cachedStaticEnv.isProot,
+      package_manager: packageManager,
+      executables,
+      capabilities,
+      limitations,
+      disk_free_mb: cachedDiskFree.value,
+      memory_total_mb: Math.round(os.totalmem() / (1024 * 1024)),
+      memory_free_mb: Math.round(os.freemem() / (1024 * 1024)),
+      panel_port: boundPort,
+      storage_engine: 'Atomic JSON Store (nodepanel.json)',
+    };
+  }
+
+  function broadcastWSEvent(event: string, data: unknown, filterServerId?: string): void {
+    const msg = JSON.stringify({ event, data });
+    for (const [client, meta] of wsClients.entries()) {
+      if (client.readyState === WebSocket.OPEN) {
+        if (!filterServerId || meta.subscriptions.has(filterServerId)) {
+          try {
+            client.send(msg);
+          } catch {
+            // Socket closing
+          }
+        }
+      }
+    }
+  }
+
+  function appendLog(serverId: string, stream: 'stdout' | 'stderr' | 'system', text: string): void {
+    const logLine: LogLine = {
+      timestamp: new Date().toISOString(),
+      stream,
+      text,
+    };
+
+    const ap = activeProcesses.get(serverId);
+    if (ap) {
+      ap.logs.push(logLine);
+      if (ap.logs.length > 1000) ap.logs.shift();
+      if (ap.logStream && !ap.logStream.destroyed) {
+        ap.logStream.write(`[${logLine.timestamp}][${stream}] ${text}\n`);
+      }
+    }
+
+    broadcastWSEvent(
+      'log',
+      {
+        server_id: serverId,
+        timestamp: logLine.timestamp,
+        stream: logLine.stream,
+        text: logLine.text,
+      },
+      serverId
+    );
+  }
+
+  function updateServerStatus(serverId: string, newStatus: ServerStatus, exitCode: number): void {
+    const server = store.getServer(serverId);
+    if (!server) return;
+    const oldStatus = server.status;
+    server.status = newStatus;
+    server.last_exit_code = exitCode;
+    store.saveServer(server);
+
+    broadcastWSEvent('status', {
+      server_id: serverId,
+      old_status: oldStatus,
+      new_status: newStatus,
+      exit_code: exitCode,
+    });
+  }
+
+  function getProcessMetrics(serverId: string): ServerMetrics | undefined {
+    const ap = activeProcesses.get(serverId);
+    const server = store.getServer(serverId);
+    if (!server) return undefined;
+
+    if (!ap || server.status !== 'running' || ap.pid <= 0) {
+      return {
+        pid: 0,
+        status: server.status,
+        uptime_sec: 0,
+        memory_mb: 0,
+        cpu_percent: 0,
+      };
+    }
+
+    const nowMs = Date.now();
+    const uptimeSec = Math.max(0, Math.floor((nowMs - ap.startTime) / 1000));
+    const memoryMb = readProcMemoryMb(ap.pid);
+
+    let cpuPercent: number | null = null;
+    const ticks = readProcCpuTicks(ap.pid);
+    if (ticks !== null) {
+      const clkTck = 100;
+      if (ap.lastCpuSample && nowMs > ap.lastCpuSample.timestampMs) {
+        const deltaTicks = Math.max(0, ticks - ap.lastCpuSample.ticks);
+        const deltaSec = (nowMs - ap.lastCpuSample.timestampMs) / 1000;
+        if (deltaSec > 0.05) {
+          cpuPercent = Math.round(((deltaTicks / clkTck) / deltaSec) * 1000) / 10;
+        }
+      }
+      if (cpuPercent === null) {
+        const elapsedSec = Math.max(0.25, (nowMs - ap.startTime) / 1000);
+        cpuPercent = Math.round(((ticks / clkTck) / elapsedSec) * 1000) / 10;
+      }
+      ap.lastCpuSample = { ticks, timestampMs: nowMs };
+    }
+
+    return {
+      pid: ap.pid,
+      status: 'running',
+      uptime_sec: uptimeSec,
+      memory_mb: memoryMb,
+      cpu_percent: cpuPercent,
+    };
+  }
+
+  function getServerWorkingDir(serverId: string): string {
+    const root = safeResolveServerPath(serverId, '');
+    if (!fs.existsSync(root)) {
+      fs.mkdirSync(root, { recursive: true });
+    }
+    const realRoot = fs.realpathSync(root);
+    const current = serverWorkingDirs.get(serverId);
+    if (current && fs.existsSync(current)) {
+      try {
+        const realCurrent = fs.realpathSync(current);
+        if (realCurrent === realRoot || realCurrent.startsWith(realRoot + path.sep)) {
+          return realCurrent;
+        }
+      } catch {
+        // Reset to root below
+      }
+    }
+    serverWorkingDirs.set(serverId, realRoot);
+    return realRoot;
+  }
+
+  function startServerProcessInternal(serverId: string, isAutoRestart = false): Promise<void> {
+    return new Promise((resolve, reject) => {
+      if (isShuttingDown) {
+        return reject(new HttpError(503, 'SHUTTING_DOWN', 'Panel server is shutting down'));
+      }
+
+      const server = store.getServer(serverId);
+      if (!server) {
+        return reject(new HttpError(404, 'SERVER_NOT_FOUND', 'Server not found'));
+      }
+
+      const existing = activeProcesses.get(serverId);
+      if (existing && existing.process.exitCode === null && !existing.intentionalStop) {
+        return reject(new HttpError(409, 'ALREADY_RUNNING', 'Server process is already running'));
+      }
+
+      const supState = getSupervisorState(serverId);
+      if (supState.restartTimer) {
+        clearTimeout(supState.restartTimer);
+        supState.restartTimer = null;
+      }
+      if (supState.stableTimer) {
+        clearTimeout(supState.stableTimer);
+        supState.stableTimer = null;
+      }
+      if (!isAutoRestart) {
+        supState.restartCount = 0;
+      }
+
+      const srvDir = safeResolveServerPath(serverId, '');
+      fs.mkdirSync(srvDir, { recursive: true });
+
+      let parsedCmd: { cmd: string; args: string[]; cleanEntry: string };
+      try {
+        parsedCmd = validateEntryCommand(serverId, server.entry_file || 'index.js');
+      } catch (err) {
+        return reject(err);
+      }
+
+      if (parsedCmd.cmd === 'node') {
+        const entryPath = safeResolveServerPath(serverId, parsedCmd.cleanEntry);
+        if (!fs.existsSync(entryPath)) {
+          if (parsedCmd.cleanEntry === 'index.js') {
+            seedServerTemplate(srvDir, 'basic_http', server.name, server.port || 3400);
+            appendLog(
+              serverId,
+              'system',
+              `[nodepanel] Notice: Entry file 'index.js' was missing. Provisioned default HTTP server.`
+            );
+          } else {
+            return reject(
+              new HttpError(400, 'MISSING_ENTRY_FILE', `Entry file '${parsedCmd.cleanEntry}' does not exist`)
+            );
+          }
+        }
+      }
+
+      const logDir = path.join(srvDir, 'logs');
+      fs.mkdirSync(logDir, { recursive: true });
+      const logFilePath = path.join(logDir, 'server.log');
+      const logStream = fs.createWriteStream(logFilePath, { flags: 'a' });
+      logStream.on('error', () => {
+        // Prevent unhandled write stream error
+      });
+
+      updateServerStatus(serverId, 'starting', 0);
+
+      // Load variables from server.env_vars and .env
+      const envVarsFromFile: Record<string, string> = {};
+      const envPath = path.join(srvDir, '.env');
+      if (fs.existsSync(envPath)) {
+        try {
+          const envContent = fs.readFileSync(envPath, 'utf-8');
+          for (const line of envContent.split('\n')) {
+            const trimmed = line.trim();
+            if (!trimmed || trimmed.startsWith('#')) continue;
+            const eqIdx = trimmed.indexOf('=');
+            if (eqIdx > 0) {
+              const k = trimmed.substring(0, eqIdx).trim();
+              let v = trimmed.substring(eqIdx + 1).trim();
+              if ((v.startsWith('"') && v.endsWith('"')) || (v.startsWith("'") && v.endsWith("'"))) {
+                v = v.substring(1, v.length - 1);
+              }
+              envVarsFromFile[k] = v;
+            }
+          }
+        } catch {
+          // Ignore malformed .env read error
+        }
+      }
+
+      const customEnv: NodeJS.ProcessEnv = {
+        ...process.env,
+        ...server.env_vars,
+        ...envVarsFromFile,
+        PORT: String(server.port || 3400),
+        NODE_ENV: envVarsFromFile.NODE_ENV || server.env_vars?.NODE_ENV || 'production',
+      };
+
+      let child: ChildProcess;
+      try {
+        child = spawn(parsedCmd.cmd, parsedCmd.args, {
+          cwd: srvDir,
+          env: customEnv,
+          shell: false,
+          detached: process.platform !== 'win32',
+          stdio: ['pipe', 'pipe', 'pipe'],
+        });
+      } catch (err: unknown) {
+        logStream.end();
+        updateServerStatus(serverId, 'failed', -1);
+        const msg = err instanceof Error ? err.message : 'Failed to spawn process';
+        return reject(new HttpError(500, 'SPAWN_FAILED', msg));
+      }
+
+      const ap: ActiveServerProcess = {
+        process: child,
+        pid: child.pid || 0,
+        startTime: Date.now(),
+        logs: [],
+        logStream,
+        intentionalStop: false,
+      };
+      activeProcesses.set(serverId, ap);
+
+      let finalized = false;
+      const finalizeProcess = (code: number | null, signal: NodeJS.Signals | null, spawnErr?: Error) => {
+        if (finalized) return;
+        finalized = true;
+
+        if (supState.stableTimer) {
+          clearTimeout(supState.stableTimer);
+          supState.stableTimer = null;
+        }
+
+        if (activeProcesses.get(serverId) === ap) {
+          activeProcesses.delete(serverId);
+        }
+
+        if (spawnErr) {
+          appendLog(serverId, 'stderr', `[nodepanel] Process error: ${spawnErr.message}`);
+          logStream.end();
+          updateServerStatus(serverId, 'failed', -1);
+          return;
+        }
+
+        const wasIntentional = ap.intentionalStop || isShuttingDown;
+        let exitCode: number;
+        let finalStatus: ServerStatus;
+
+        if (wasIntentional) {
+          exitCode = code !== null ? code : 0;
+          finalStatus = 'stopped';
+          appendLog(
+            serverId,
+            'system',
+            `[nodepanel] Process stopped gracefully (code ${exitCode}${signal ? `, ${signal}` : ''})`
+          );
+        } else if (code === 0) {
+          exitCode = 0;
+          finalStatus = 'stopped';
+          appendLog(serverId, 'system', '[nodepanel] Process exited cleanly with code 0');
+        } else {
+          exitCode =
+            code !== null
+              ? code
+              : signal === 'SIGKILL'
+                ? 137
+                : signal === 'SIGTERM'
+                  ? 143
+                  : 1;
+          finalStatus = 'crashed';
+          appendLog(
+            serverId,
+            'system',
+            `[nodepanel] Process crashed with exit code ${exitCode}${signal ? ` (${signal})` : ''}`
+          );
+        }
+
+        logStream.end();
+
+        // Only update persisted status if server wasn't deleted
+        const currentSrv = store.getServer(serverId);
+        if (!currentSrv) return;
+
+        updateServerStatus(serverId, finalStatus, exitCode);
+
+        if (!wasIntentional && !isShuttingDown) {
+          const shouldRestart =
+            currentSrv.auto_restart === 'always' ||
+            (currentSrv.auto_restart === 'on-failure' && exitCode !== 0);
+
+          if (shouldRestart) {
+            supState.restartCount += 1;
+            if (supState.restartCount <= maxAutoRestarts) {
+              const backoffMs = supState.restartCount * autoRestartBaseMs;
+              appendLog(
+                serverId,
+                'system',
+                `[nodepanel] Auto-restarting in ${(backoffMs / 1000).toFixed(1)}s (attempt ${supState.restartCount}/${maxAutoRestarts})...`
+              );
+              supState.restartTimer = setTimeout(() => {
+                supState.restartTimer = null;
+                if (isShuttingDown || !store.getServer(serverId)) return;
+                withServerLock(serverId, () => startServerProcessInternal(serverId, true)).catch(
+                  (restartErr: unknown) => {
+                    const msg = restartErr instanceof Error ? restartErr.message : String(restartErr);
+                    appendLog(serverId, 'stderr', `[nodepanel] Auto-restart failed: ${msg}`);
+                  }
+                );
+              }, backoffMs);
+            } else {
+              updateServerStatus(serverId, 'failed', exitCode);
+              appendLog(
+                serverId,
+                'system',
+                `[nodepanel] Maximum auto-restart attempts reached (${maxAutoRestarts}). Halting.`
+              );
+              store.recordActivity(
+                'auto_restart_halted',
+                serverId,
+                `Halted after ${maxAutoRestarts} crash restarts`,
+                'failed'
+              );
+            }
+          }
+        }
+      };
+
+      child.on('error', (err) => {
+        finalizeProcess(null, null, err);
+      });
+
+      child.stdout?.on('data', (data: Buffer) => {
+        const lines = data.toString('utf-8').split('\n');
+        for (const line of lines) {
+          if (line.trim().length > 0) appendLog(serverId, 'stdout', line);
+        }
+      });
+
+      child.stderr?.on('data', (data: Buffer) => {
+        const lines = data.toString('utf-8').split('\n');
+        for (const line of lines) {
+          if (line.trim().length > 0) appendLog(serverId, 'stderr', line);
+        }
+      });
+
+      child.on('exit', (code, signal) => {
+        finalizeProcess(code, signal);
+      });
+
+      // Reset crash counter once server runs stably for 30s
+      supState.stableTimer = setTimeout(() => {
+        supState.stableTimer = null;
+        if (activeProcesses.get(serverId) === ap && !ap.intentionalStop) {
+          supState.restartCount = 0;
+        }
+      }, 30_000);
+      supState.stableTimer.unref?.();
+
+      updateServerStatus(serverId, 'running', 0);
+      appendLog(
+        serverId,
+        'system',
+        `[nodepanel] Process started (PID: ${ap.pid}) using "${parsedCmd.cmd} ${parsedCmd.args.join(' ')}"`
+      );
+      store.recordActivity(
+        'start_server',
+        serverId,
+        `Server '${server.name}' started (PID: ${ap.pid})`,
+        'success'
+      );
+
+      resolve();
+    });
+  }
+
+  function stopServerProcessInternal(serverId: string): Promise<void> {
+    clearSupervisorTimers(serverId, true);
+
+    return new Promise((resolve) => {
+      const ap = activeProcesses.get(serverId);
+      if (!ap || ap.process.exitCode !== null) {
+        activeProcesses.delete(serverId);
+        if (store.getServer(serverId)) {
+          updateServerStatus(serverId, 'stopped', 0);
+        }
+        return resolve();
+      }
+
+      ap.intentionalStop = true;
+      updateServerStatus(serverId, 'stopping', 0);
+      appendLog(serverId, 'system', '[nodepanel] Sending SIGTERM to process group...');
+
+      let settled = false;
+      const finish = () => {
+        if (settled) return;
+        settled = true;
+        clearTimeout(forceKillTimer);
+        resolve();
+      };
+
+      const forceKillTimer = setTimeout(() => {
+        if (!settled) {
+          appendLog(serverId, 'system', '[nodepanel] Graceful timeout elapsed; sending SIGKILL...');
+          killProcessTree(ap.process, 'SIGKILL');
+          setTimeout(finish, 150);
+        }
+      }, stopGraceTimeoutMs);
+
+      ap.process.once('exit', () => {
+        finish();
+      });
+
+      killProcessTree(ap.process, 'SIGTERM');
+    });
+  }
+
+  function executeTerminalCommand(serverId: string, commandText: string): void {
+    const trimmed = commandText.trim();
+    if (!trimmed) return;
+
+    let serverRoot: string;
+    try {
+      assertValidServerId(serverId);
+      serverRoot = safeResolveServerPath(serverId, '');
+    } catch {
+      return;
+    }
+
+    const server = store.getServer(serverId);
+    if (!server) {
+      broadcastWSEvent(
+        'terminal_data',
+        {
+          serverId,
+          stream: 'system',
+          text: `[nodepanel-term] Error: Server ${serverId} not found.`,
+        },
+        serverId
+      );
+      return;
+    }
+
+    fs.mkdirSync(serverRoot, { recursive: true });
+    const realServerRoot = fs.realpathSync(serverRoot);
+    const currentCwd = getServerWorkingDir(serverId);
+    const relCwdDisplay = path.relative(realServerRoot, currentCwd) || '.';
+
+    broadcastWSEvent(
+      'terminal_data',
+      {
+        serverId,
+        stream: 'command',
+        text: `$ ${trimmed}`,
+        cwd: relCwdDisplay,
+      },
+      serverId
+    );
+
+    if (trimmed === 'cd' || trimmed.startsWith('cd ')) {
+      const targetArg = trimmed === 'cd' ? '' : trimmed.substring(3).trim();
+      const candidatePath =
+        targetArg && targetArg !== '~' ? path.resolve(currentCwd, targetArg) : realServerRoot;
+
+      if (candidatePath !== realServerRoot && !candidatePath.startsWith(realServerRoot + path.sep)) {
+        broadcastWSEvent(
+          'terminal_data',
+          {
+            serverId,
+            stream: 'stderr',
+            text: `cd: restricted to server workspace (${relCwdDisplay})`,
+          },
+          serverId
+        );
+        broadcastWSEvent('terminal_exit', { serverId, exitCode: 1, cwd: relCwdDisplay }, serverId);
+        return;
+      }
+
+      if (!fs.existsSync(candidatePath) || !fs.statSync(candidatePath).isDirectory()) {
+        broadcastWSEvent(
+          'terminal_data',
+          {
+            serverId,
+            stream: 'stderr',
+            text: `cd: no such directory: ${targetArg}`,
+          },
+          serverId
+        );
+        broadcastWSEvent('terminal_exit', { serverId, exitCode: 1, cwd: relCwdDisplay }, serverId);
+        return;
+      }
+
+      const realTarget = fs.realpathSync(candidatePath);
+      if (realTarget !== realServerRoot && !realTarget.startsWith(realServerRoot + path.sep)) {
+        broadcastWSEvent(
+          'terminal_data',
+          {
+            serverId,
+            stream: 'stderr',
+            text: 'cd: symbolic link outside server workspace is not permitted',
+          },
+          serverId
+        );
+        broadcastWSEvent('terminal_exit', { serverId, exitCode: 1, cwd: relCwdDisplay }, serverId);
+        return;
+      }
+
+      serverWorkingDirs.set(serverId, realTarget);
+      const updatedRel = path.relative(realServerRoot, realTarget) || '.';
+      broadcastWSEvent(
+        'terminal_data',
+        {
+          serverId,
+          stream: 'system',
+          text: `Directory changed to: /${updatedRel === '.' ? '' : updatedRel}`,
+        },
+        serverId
+      );
+      broadcastWSEvent('terminal_exit', { serverId, exitCode: 0, cwd: updatedRel }, serverId);
+      return;
+    }
+
+    if (trimmed === 'clear') {
+      broadcastWSEvent('terminal_clear', { serverId }, serverId);
+      broadcastWSEvent('terminal_exit', { serverId, exitCode: 0, cwd: relCwdDisplay }, serverId);
+      return;
+    }
+
+    const existing = activeTerminals.get(serverId);
+    if (existing) {
+      broadcastWSEvent(
+        'terminal_data',
+        {
+          serverId,
+          stream: 'system',
+          text: `[nodepanel-term] Terminating previous command (${existing.command})...`,
+        },
+        serverId
+      );
+      killProcessTree(existing.process, 'SIGINT');
+    }
+
+    try {
+      const child = spawn(trimmed, {
+        shell: true,
+        cwd: currentCwd,
+        detached: process.platform !== 'win32',
+        env: {
+          ...process.env,
+          ...server.env_vars,
+          PORT: String(server.port || 3400),
+        },
+        stdio: ['pipe', 'pipe', 'pipe'],
+      });
+
+      const termSession: ActiveTerminalProcess = {
+        process: child,
+        serverId,
+        command: trimmed,
+        startTime: Date.now(),
+        cwd: currentCwd,
+      };
+      activeTerminals.set(serverId, termSession);
+
+      broadcastWSEvent(
+        'terminal_start',
+        {
+          serverId,
+          command: trimmed,
+          pid: child.pid,
+          cwd: relCwdDisplay,
+        },
+        serverId
+      );
+
+      child.stdout?.on('data', (chunk: Buffer) => {
+        const lines = chunk.toString('utf-8').split('\n');
+        for (const line of lines) {
+          if (line.length > 0) {
+            broadcastWSEvent('terminal_data', { serverId, stream: 'stdout', text: line }, serverId);
+          }
+        }
+      });
+
+      child.stderr?.on('data', (chunk: Buffer) => {
+        const lines = chunk.toString('utf-8').split('\n');
+        for (const line of lines) {
+          if (line.length > 0) {
+            broadcastWSEvent('terminal_data', { serverId, stream: 'stderr', text: line }, serverId);
+          }
+        }
+      });
+
+      child.on('error', (err) => {
+        broadcastWSEvent(
+          'terminal_data',
+          {
+            serverId,
+            stream: 'stderr',
+            text: `[nodepanel-term] Spawn error: ${err.message}`,
+          },
+          serverId
+        );
+      });
+
+      child.on('exit', (code, signal) => {
+        if (activeTerminals.get(serverId) === termSession) {
+          activeTerminals.delete(serverId);
+        }
+        const exitCode = code !== null ? code : signal ? 130 : 0;
+        const durationMs = Date.now() - termSession.startTime;
+        broadcastWSEvent(
+          'terminal_data',
+          {
+            serverId,
+            stream: 'system',
+            text: `[process exited with code ${exitCode}${signal ? ` (${signal})` : ''} in ${(durationMs / 1000).toFixed(1)}s]`,
+          },
+          serverId
+        );
+        broadcastWSEvent(
+          'terminal_exit',
+          {
+            serverId,
+            exitCode,
+            signal,
+            cwd: relCwdDisplay,
+          },
+          serverId
+        );
+      });
+    } catch (err: unknown) {
+      const msg = err instanceof Error ? err.message : 'Unknown spawn error';
+      broadcastWSEvent(
+        'terminal_data',
+        {
+          serverId,
+          stream: 'stderr',
+          text: `[nodepanel-term] Failed to start command: ${msg}`,
+        },
+        serverId
+      );
+      broadcastWSEvent('terminal_exit', { serverId, exitCode: 1, cwd: relCwdDisplay }, serverId);
+    }
+  }
+
+  function killTerminalCommand(serverId: string): void {
+    const session = activeTerminals.get(serverId);
+    if (!session) return;
+
+    broadcastWSEvent(
+      'terminal_data',
+      {
+        serverId,
+        stream: 'system',
+        text: '^C [nodepanel-term] Sending SIGINT to process group...',
+      },
+      serverId
+    );
+
+    killProcessTree(session.process, 'SIGINT');
+
+    const killTimer = setTimeout(() => {
+      if (activeTerminals.get(serverId) === session) {
+        killProcessTree(session.process, 'SIGKILL');
+      }
+    }, 1500);
+    killTimer.unref?.();
+  }
+
+  function findAvailablePort(startPort = 3001): number {
+    const used = new Set<number>([3000, boundPort]);
+    for (const s of store.listServers()) {
+      if (s.port) used.add(s.port);
+    }
+    let p = Math.max(1024, startPort);
+    while (used.has(p) && p < 65534) {
+      p++;
+    }
+    return p;
+  }
+
+  function readServerLogsFromFile(serverId: string): LogLine[] {
+    let logFile: string;
+    try {
+      logFile = safeResolveServerPath(serverId, 'logs/server.log');
+    } catch {
+      return [];
+    }
+    if (!fs.existsSync(logFile)) return [];
+    try {
+      const stat = fs.statSync(logFile);
+      const maxRead = 256 * 1024;
+      let content = '';
+      if (stat.size > maxRead) {
+        const fd = fs.openSync(logFile, 'r');
+        try {
+          const buf = Buffer.alloc(maxRead);
+          fs.readSync(fd, buf, 0, maxRead, stat.size - maxRead);
+          content = buf.toString('utf-8');
+        } finally {
+          fs.closeSync(fd);
+        }
+      } else {
+        content = fs.readFileSync(logFile, 'utf-8');
+      }
+      const lines = content
+        .split('\n')
+        .filter((l) => l.trim().length > 0)
+        .slice(-500);
+      return lines.map((line) => {
+        const parsed = line.match(/^\[([^\]]+)\]\[(stdout|stderr|system)\]\s?(.*)$/);
+        if (parsed) {
+          return {
+            timestamp: parsed[1],
+            stream: parsed[2] as 'stdout' | 'stderr' | 'system',
+            text: parsed[3],
+          };
+        }
+        return {
+          timestamp: stat.mtime.toISOString(),
+          stream: 'file',
+          text: line,
+        };
+      });
+    } catch {
+      return [];
+    }
+  }
+
+  // --- Express Application Setup ---
+  const app = express();
+  app.disable('x-powered-by');
+
+  // Security headers (iframe-compatible for AI Studio preview)
+  app.use((req, res, next) => {
+    res.setHeader('X-Content-Type-Options', 'nosniff');
+    res.setHeader('Referrer-Policy', 'strict-origin-when-cross-origin');
+
+    const origin = req.headers.origin;
+    const effectiveHost = (req.headers['x-forwarded-host'] as string) || req.headers.host;
+
+    if (origin) {
+      if (!isOriginAllowed(origin, effectiveHost)) {
+        if (req.path.startsWith('/api')) {
+          return res.status(403).json({
+            error: true,
+            code: 'FORBIDDEN_ORIGIN',
+            message: 'Cross-origin request denied by security policy',
+          });
+        }
+        return res.status(403).end();
+      }
+      res.setHeader('Access-Control-Allow-Origin', origin);
+      res.setHeader('Vary', 'Origin');
+      res.setHeader('Access-Control-Allow-Methods', 'GET, POST, PUT, DELETE, OPTIONS');
+      res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization, X-API-Key, X-Requested-With');
+    }
+
+    if (req.method === 'OPTIONS') {
+      return res.sendStatus(204);
+    }
+    next();
+  });
+
+  app.use(express.json({ limit: '2mb' }));
+
+  // Sliding-window API rate limiter + optional API_SECRET_KEY authentication
+  app.use('/api', (req, res, next) => {
+    const now = Date.now();
+    const clientIp = req.ip || req.socket.remoteAddress || 'local';
+    let bucket = rateBuckets.get(clientIp);
+    if (!bucket || now >= bucket.resetAt) {
+      bucket = { count: 0, resetAt: now + 60_000 };
+      rateBuckets.set(clientIp, bucket);
+    }
+    bucket.count += 1;
+    if (bucket.count > rateLimitMax) {
+      res.setHeader('Retry-After', String(Math.ceil((bucket.resetAt - now) / 1000)));
+      return res.status(429).json({
+        error: true,
+        code: 'RATE_LIMITED',
+        message: 'Too many API requests. Please wait before retrying.',
+      });
+    }
+
+    if (apiSecretKey && req.path !== '/health') {
+      const authHeader = req.headers.authorization || '';
+      const bearerToken = authHeader.startsWith('Bearer ') ? authHeader.slice(7).trim() : '';
+      const headerKey = (req.headers['x-api-key'] as string | undefined)?.trim() || '';
+      const provided = bearerToken || headerKey;
+
+      if (!provided || provided !== apiSecretKey) {
+        return res.status(401).json({
+          error: true,
+          code: 'UNAUTHORIZED',
+          message: 'Valid authentication credentials are required.',
+        });
+      }
+    }
+
     next();
   });
 
@@ -1097,7 +1861,6 @@ async function main() {
 
   // --- API Routes ---
 
-  // Health
   app.get('/api/health', (_req: Request, res: Response) => {
     const env = detectEnvironment();
     res.json({
@@ -1105,83 +1868,109 @@ async function main() {
       version: '1.0.0',
       uptime_seconds: Math.floor(process.uptime()),
       environment: env.type,
+      active_servers: activeProcesses.size,
       timestamp: new Date().toISOString(),
     });
   });
 
-  // Runtime
   app.get('/api/runtime', (_req: Request, res: Response) => {
-    const env = detectEnvironment();
-    res.json(env);
+    res.json(detectEnvironment());
   });
 
-  // Activity
   app.get('/api/activity', (_req: Request, res: Response) => {
     res.json(store.listActivities());
   });
 
-  // Packages
-  app.get('/api/packages', (_req: Request, res: Response) => {
-    const pkgs = Object.values(PACKAGE_REGISTRY).map((spec) => {
-      const copy = { ...spec };
-      const p = lookPath(spec.executable);
-      if (p) {
-        copy.installed = true;
-        copy.path = p;
-        copy.version = getToolVersion(spec.executable);
-      } else {
-        copy.installed = false;
-      }
-      return copy;
-    });
+  app.get('/api/packages', async (_req: Request, res: Response, next: NextFunction) => {
+    try {
+      const pkgs = await Promise.all(
+        Object.values(PACKAGE_REGISTRY).map(async (spec) => {
+          const copy: PackageSpec = { ...spec, pkg_map: { ...spec.pkg_map } };
+          const p = lookPathFast(spec.executable);
+          if (p) {
+            copy.installed = true;
+            copy.path = p;
+            copy.version = await getToolVersionAsync(p);
+          } else {
+            copy.installed = false;
+          }
+          return copy;
+        })
+      );
 
-    res.json({
-      packages: pkgs,
-      is_busy: isPackageOpBusy,
-      active_op: activePackageOp,
-    });
+      res.json({
+        packages: pkgs,
+        is_busy: isPackageOpBusy,
+        active_op: activePackageOp,
+      });
+    } catch (err) {
+      next(err);
+    }
   });
 
   app.post('/api/packages/install', async (req: Request, res: Response) => {
-    const { package_id } = req.body;
-    if (!package_id || !PACKAGE_REGISTRY[package_id]) {
-      return res.status(400).json({ error: true, message: 'Valid package_id required' });
+    const packageId = typeof req.body?.package_id === 'string' ? req.body.package_id.trim() : '';
+    if (!packageId || !Object.prototype.hasOwnProperty.call(PACKAGE_REGISTRY, packageId)) {
+      return res.status(400).json({
+        error: true,
+        code: 'INVALID_PACKAGE',
+        message: 'Valid package_id from the supported registry is required',
+      });
     }
     if (isPackageOpBusy) {
-      return res.status(400).json({ error: true, message: 'A package operation is already in progress' });
+      return res.status(409).json({
+        error: true,
+        code: 'PACKAGE_OP_BUSY',
+        message: 'Another package operation is currently in progress',
+      });
     }
 
-    const spec = PACKAGE_REGISTRY[package_id];
+    const spec = PACKAGE_REGISTRY[packageId];
     const env = detectEnvironment();
     const pkgMgr = env.package_manager;
 
     if (!pkgMgr || pkgMgr === 'none') {
       return res.status(400).json({
-        success: false,
-        error: `No package manager (pkg or apt) available in this environment.`,
+        error: true,
+        code: 'NO_PACKAGE_MANAGER',
+        message: 'No supported system package manager (pkg, apt-get, pacman, apk) available.',
         output: 'Operation aborted: no supported package manager.',
       });
     }
 
     const pkgName = spec.pkg_map[pkgMgr] || spec.id;
-    isPackageOpBusy = true;
-    activePackageOp = `install:${package_id}`;
+    let bin = pkgMgr;
+    let args: string[] = ['install', '-y', pkgName];
+    if (pkgMgr === 'pacman') {
+      bin = 'pacman';
+      args = ['-S', '--noconfirm', pkgName];
+    } else if (pkgMgr === 'apk') {
+      bin = 'apk';
+      args = ['add', pkgName];
+    }
 
-    let output = `[nodepanel-pkg] Initiating installation of ${spec.name} via ${pkgMgr} install -y ${pkgName}...\n`;
+    isPackageOpBusy = true;
+    activePackageOp = `install:${packageId}`;
+    let logOutput = `[nodepanel-pkg] Installing ${spec.name} (${bin} ${args.join(' ')})...\n`;
 
     try {
-      let installCmd = `${pkgMgr} install -y ${pkgName}`;
-      if (pkgMgr === 'apt-get') installCmd = `apt-get install -y ${pkgName}`;
-      const execOut = execSync(installCmd, { encoding: 'utf-8', timeout: 300000 });
-      output += execOut;
-      output += `\n[nodepanel-pkg] Successfully installed ${spec.name}!`;
-
-      store.recordActivity('install_package', '', `Installed package ${package_id}`, 'success');
-      res.json({ success: true, output });
-    } catch (err: any) {
-      output += `\n[nodepanel-pkg] Error during installation: ${err.message}`;
-      store.recordActivity('install_package', '', `Failed installing ${package_id}: ${err.message}`, 'failed');
-      res.status(500).json({ success: false, error: err.message, output });
+      const result = await runCommandAsync(bin, args, { timeoutMs: 300_000 });
+      versionCache.clear();
+      cachedStaticEnv = null;
+      logOutput += `${result.output}\n[nodepanel-pkg] Successfully installed ${spec.name}.`;
+      store.recordActivity('install_package', '', `Installed package ${packageId}`, 'success');
+      return res.json({ success: true, output: logOutput });
+    } catch (err: unknown) {
+      const msg = err instanceof Error ? err.message : 'Package installation failed';
+      const cmdOut = (err as { output?: string })?.output || '';
+      logOutput += `${cmdOut}\n[nodepanel-pkg] Error: ${msg}`;
+      store.recordActivity('install_package', '', `Failed installing ${packageId}: ${msg}`, 'failed');
+      return res.status(400).json({
+        error: true,
+        code: 'PACKAGE_INSTALL_FAILED',
+        message: msg,
+        output: logOutput,
+      });
     } finally {
       isPackageOpBusy = false;
       activePackageOp = '';
@@ -1189,57 +1978,139 @@ async function main() {
   });
 
   app.post('/api/packages/uninstall', async (req: Request, res: Response) => {
-    const { package_id } = req.body;
-    if (package_id === 'git') {
-      return res.status(400).json({ error: true, message: 'Uninstalling git is disabled for system safety.' });
+    const packageId = typeof req.body?.package_id === 'string' ? req.body.package_id.trim() : '';
+    if (packageId === 'git') {
+      return res.status(400).json({
+        error: true,
+        code: 'PROTECTED_PACKAGE',
+        message: 'Uninstalling git is disabled for system safety.',
+      });
     }
-    if (!package_id || !PACKAGE_REGISTRY[package_id]) {
-      return res.status(400).json({ error: true, message: 'Valid package_id required' });
+    if (!packageId || !Object.prototype.hasOwnProperty.call(PACKAGE_REGISTRY, packageId)) {
+      return res.status(400).json({
+        error: true,
+        code: 'INVALID_PACKAGE',
+        message: 'Valid package_id from the supported registry is required',
+      });
+    }
+    if (isPackageOpBusy) {
+      return res.status(409).json({
+        error: true,
+        code: 'PACKAGE_OP_BUSY',
+        message: 'Another package operation is currently in progress',
+      });
     }
 
-    const spec = PACKAGE_REGISTRY[package_id];
+    const spec = PACKAGE_REGISTRY[packageId];
     const env = detectEnvironment();
     const pkgMgr = env.package_manager;
 
     if (!pkgMgr || pkgMgr === 'none') {
-      return res.status(400).json({ success: false, error: 'No package manager available' });
+      return res.status(400).json({
+        error: true,
+        code: 'NO_PACKAGE_MANAGER',
+        message: 'No supported system package manager available',
+      });
     }
 
     const pkgName = spec.pkg_map[pkgMgr] || spec.id;
-    let output = `[nodepanel-pkg] Removing ${spec.name}...\n`;
+    let bin = pkgMgr;
+    let args: string[] = ['remove', '-y', pkgName];
+    if (pkgMgr === 'pkg') {
+      bin = 'pkg';
+      args = ['uninstall', '-y', pkgName];
+    } else if (pkgMgr === 'pacman') {
+      bin = 'pacman';
+      args = ['-R', '--noconfirm', pkgName];
+    } else if (pkgMgr === 'apk') {
+      bin = 'apk';
+      args = ['del', pkgName];
+    }
+
+    isPackageOpBusy = true;
+    activePackageOp = `uninstall:${packageId}`;
+    let logOutput = `[nodepanel-pkg] Removing ${spec.name}...\n`;
 
     try {
-      const removeCmd = pkgMgr === 'pkg' ? `pkg uninstall -y ${pkgName}` : `apt-get remove -y ${pkgName}`;
-      output += execSync(removeCmd, { encoding: 'utf-8', timeout: 180000 });
-      output += `\n[nodepanel-pkg] Removed ${spec.name}.`;
-      store.recordActivity('uninstall_package', '', `Uninstalled package ${package_id}`, 'success');
-      res.json({ success: true, output });
-    } catch (err: any) {
-      output += `\n[nodepanel-pkg] Error during uninstall: ${err.message}`;
-      res.status(400).json({ success: false, error: err.message, output });
+      const result = await runCommandAsync(bin, args, { timeoutMs: 180_000 });
+      versionCache.clear();
+      cachedStaticEnv = null;
+      logOutput += `${result.output}\n[nodepanel-pkg] Removed ${spec.name}.`;
+      store.recordActivity('uninstall_package', '', `Uninstalled package ${packageId}`, 'success');
+      return res.json({ success: true, output: logOutput });
+    } catch (err: unknown) {
+      const msg = err instanceof Error ? err.message : 'Package removal failed';
+      const cmdOut = (err as { output?: string })?.output || '';
+      logOutput += `${cmdOut}\n[nodepanel-pkg] Error: ${msg}`;
+      return res.status(400).json({
+        error: true,
+        code: 'PACKAGE_REMOVE_FAILED',
+        message: msg,
+        output: logOutput,
+      });
+    } finally {
+      isPackageOpBusy = false;
+      activePackageOp = '';
     }
   });
 
-  // Git Clone
+  // Git Clone (Command-Injection Hardened with shell: false + strict URL/branch validation)
   app.post('/api/git/clone', async (req: Request, res: Response) => {
-    const { repo_url, branch, name, auto_install } = req.body;
-    if (!repo_url) {
-      return res.status(400).json({ error: true, message: 'repo_url is required' });
+    const rawRepoUrl = typeof req.body?.repo_url === 'string' ? req.body.repo_url.trim() : '';
+    const rawBranch = typeof req.body?.branch === 'string' ? req.body.branch.trim() : '';
+    const rawName = typeof req.body?.name === 'string' ? req.body.name.trim() : '';
+    const autoInstall = Boolean(req.body?.auto_install);
+
+    if (!rawRepoUrl) {
+      return res.status(400).json({
+        error: true,
+        code: 'INVALID_REPO_URL',
+        message: 'Repository URL is required',
+      });
+    }
+
+    if (
+      rawRepoUrl.length > 512 ||
+      rawRepoUrl.startsWith('-') ||
+      !SAFE_GIT_URL_REGEX.test(rawRepoUrl)
+    ) {
+      return res.status(400).json({
+        error: true,
+        code: 'INVALID_REPO_URL',
+        message: 'Repository URL must use https://, git@, ssh://, or file:// without shell metacharacters',
+      });
+    }
+
+    if (
+      rawBranch &&
+      (rawBranch.startsWith('-') || rawBranch.includes('..') || !SAFE_GIT_BRANCH_REGEX.test(rawBranch))
+    ) {
+      return res.status(400).json({
+        error: true,
+        code: 'INVALID_GIT_BRANCH',
+        message: 'Invalid branch name format',
+      });
     }
 
     const serverId = `srv-${Math.floor(Date.now() / 1000) % 100000}-${crypto.randomBytes(4).toString('hex')}`;
-    const srvDir = path.join(SERVERS_DIR, serverId);
+    const srvDir = safeResolveServerPath(serverId, '');
     fs.mkdirSync(srvDir, { recursive: true });
 
-    let output = `[nodepanel-git] Cloning repository: ${repo_url}...\n`;
+    let output = `[nodepanel-git] Cloning repository ${rawRepoUrl}...\n`;
 
     try {
-      const branchFlag = branch ? `--branch ${branch}` : '';
-      execSync(`git clone --depth 1 ${branchFlag} "${repo_url}" "${srvDir}"`, {
-        encoding: 'utf-8',
-        timeout: 180000,
+      const cloneArgs = ['clone', '--depth', '1'];
+      if (rawBranch) {
+        cloneArgs.push('--branch', rawBranch);
+      }
+      cloneArgs.push('--', rawRepoUrl, srvDir);
+
+      const cloneRes = await runCommandAsync('git', cloneArgs, {
+        timeoutMs: 180_000,
+        env: { ...process.env, GIT_TERMINAL_PROMPT: '0' },
       });
-      output += `[nodepanel-git] Repository successfully cloned into ${serverId}.\n`;
+      if (cloneRes.output) output += `${cloneRes.output}\n`;
+      output += `[nodepanel-git] Repository cloned into ${serverId}.\n`;
 
       let entryFile = 'index.js';
       const candidates = ['index.js', 'app.js', 'server.js', 'main.js', 'src/index.js', 'src/server.js'];
@@ -1253,35 +2124,55 @@ async function main() {
       const pkgPath = path.join(srvDir, 'package.json');
       if (fs.existsSync(pkgPath)) {
         try {
-          const pkgJson = JSON.parse(fs.readFileSync(pkgPath, 'utf-8'));
-          if (pkgJson.main && fs.existsSync(path.join(srvDir, pkgJson.main))) {
-            entryFile = pkgJson.main;
+          const pkgJson = JSON.parse(fs.readFileSync(pkgPath, 'utf-8')) as {
+            main?: string;
+            scripts?: { start?: string };
+          };
+          if (pkgJson.main && typeof pkgJson.main === 'string') {
+            try {
+              const resolvedMain = safeResolveServerPath(serverId, pkgJson.main);
+              if (fs.existsSync(resolvedMain)) {
+                entryFile = pkgJson.main.replace(/^[./\\]+/, '') || 'index.js';
+              }
+            } catch {
+              // Ignore unsafe package.json main
+            }
           } else if (pkgJson.scripts?.start) {
             entryFile = 'npm start';
           }
-        } catch {}
+        } catch {
+          // Ignore malformed package.json
+        }
       }
 
-      if (auto_install && fs.existsSync(pkgPath)) {
-        output += `[nodepanel-git] Running npm install...\n`;
+      if (autoInstall && fs.existsSync(pkgPath)) {
+        output += '[nodepanel-git] Running npm install...\n';
         try {
-          output += execSync('npm install --no-audit --no-fund', {
+          const npmRes = await runCommandAsync('npm', ['install', '--no-audit', '--no-fund'], {
             cwd: srvDir,
-            encoding: 'utf-8',
-            timeout: 300000,
+            timeoutMs: 300_000,
           });
-        } catch (npme: any) {
-          output += `[nodepanel-git] Warning: npm install had issues: ${npme.message}\n`;
+          output += `${npmRes.output}\n`;
+        } catch (npmErr: unknown) {
+          const msg = npmErr instanceof Error ? npmErr.message : String(npmErr);
+          output += `[nodepanel-git] Warning: npm install reported an issue: ${msg}\n`;
         }
       }
 
       const assignedPort = findAvailablePort(3001);
-      const serverName = name || repo_url.split('/').pop()?.replace('.git', '') || 'Git Server';
+      const inferredName =
+        rawName ||
+        rawRepoUrl
+          .split('/')
+          .pop()
+          ?.replace(/\.git$/i, '')
+          ?.slice(0, 64) ||
+        'Git Server';
 
       const srv: ServerModel = {
         id: serverId,
-        name: serverName,
-        description: `Cloned from ${repo_url} (${branch || 'default'})`,
+        name: inferredName,
+        description: `Cloned from ${rawRepoUrl}${rawBranch ? ` (${rawBranch})` : ''}`,
         port: assignedPort,
         entry_file: entryFile,
         start_script: 'start',
@@ -1291,25 +2182,31 @@ async function main() {
           PORT: String(assignedPort),
           NODE_ENV: 'production',
         },
-        repo_url,
+        repo_url: rawRepoUrl,
         created_at: new Date().toISOString(),
         updated_at: new Date().toISOString(),
         last_exit_code: 0,
       };
 
       store.saveServer(srv);
-      store.recordActivity('git_clone', serverId, `Cloned repository ${repo_url}`, 'success');
+      store.recordActivity('git_clone', serverId, `Cloned repository ${rawRepoUrl}`, 'success');
 
-      res.status(201).json({
+      return res.status(201).json({
         success: true,
         server: srv,
         output,
       });
-    } catch (err: any) {
+    } catch (err: unknown) {
       fs.rmSync(srvDir, { recursive: true, force: true });
-      output += `\n[nodepanel-git] Clone failed: ${err.message}`;
-      store.recordActivity('git_clone', serverId, `Clone failed: ${err.message}`, 'failed');
-      res.status(400).json({ success: false, error: err.message, output });
+      const msg = err instanceof Error ? err.message : 'Git clone failed';
+      output += `\n[nodepanel-git] Clone failed: ${msg}`;
+      store.recordActivity('git_clone', serverId, `Clone failed: ${msg}`, 'failed');
+      return res.status(400).json({
+        error: true,
+        code: 'GIT_CLONE_FAILED',
+        message: msg,
+        output,
+      });
     }
   });
 
@@ -1322,376 +2219,545 @@ async function main() {
     res.json(list);
   });
 
-  app.post('/api/servers', (req: Request, res: Response) => {
-    const { name, description, port, entry_file, auto_restart, env_vars, template } = req.body;
-    if (!name || !name.trim()) {
-      return res.status(400).json({ error: true, message: 'Server name is required' });
-    }
-
-    const serverId = `srv-${Math.floor(Date.now() / 1000) % 100000}-${crypto.randomBytes(4).toString('hex')}`;
-    const srvDir = path.join(SERVERS_DIR, serverId);
-    fs.mkdirSync(srvDir, { recursive: true });
-
-    const assignedPort = port && port > 0 ? port : findAvailablePort(3001);
-    const entry = (entry_file || 'index.js').trim();
-
-    seedServerTemplate(srvDir, template, name.trim(), assignedPort);
-
-    const mergedEnv = {
-      ...(env_vars || {}),
-      PORT: String(assignedPort),
-      NODE_ENV: env_vars?.NODE_ENV || 'production',
-    };
-
-    const srv: ServerModel = {
-      id: serverId,
-      name: name.trim(),
-      description: description || '',
-      port: assignedPort,
-      entry_file: entry,
-      start_script: 'start',
-      status: 'created',
-      auto_restart: autoRestartPolicyValid(auto_restart) ? auto_restart : 'never',
-      env_vars: mergedEnv,
-      created_at: new Date().toISOString(),
-      updated_at: new Date().toISOString(),
-      last_exit_code: 0,
-    };
-
-    store.saveServer(srv);
-    store.recordActivity('create_server', serverId, `Created server '${name.trim()}' on port ${assignedPort}`, 'success');
-
-    res.status(201).json(srv);
-  });
-
-  function autoRestartPolicyValid(val: any): val is AutoRestartPolicy {
-    return ['never', 'always', 'on-failure'].includes(val);
-  }
-
-  // Server Details & Update & Delete
-  app.get('/api/servers/:id', (req: Request, res: Response) => {
-    const srv = store.getServer(req.params.id);
-    if (!srv) return res.status(404).json({ error: true, message: 'Server not found' });
-
-    const ap = activeProcesses.get(srv.id);
-    const recentLogs = ap ? [...ap.logs] : readServerLogsFromFile(srv.id);
-
-    res.json({
-      ...srv,
-      metrics: getProcessMetrics(srv.id),
-      recent_logs: recentLogs,
-    });
-  });
-
-  app.put('/api/servers/:id', (req: Request, res: Response) => {
-    const srv = store.getServer(req.params.id);
-    if (!srv) return res.status(404).json({ error: true, message: 'Server not found' });
-
-    const { name, description, port, entry_file, auto_restart, env_vars } = req.body;
-    if (name) srv.name = name;
-    if (description !== undefined) srv.description = description;
-    if (port && port > 0) srv.port = port;
-    if (entry_file) srv.entry_file = entry_file;
-    if (autoRestartPolicyValid(auto_restart)) srv.auto_restart = auto_restart;
-    if (env_vars) srv.env_vars = env_vars;
-
-    store.saveServer(srv);
-    res.json(srv);
-  });
-
-  app.delete('/api/servers/:id', async (req: Request, res: Response) => {
-    const id = req.params.id;
-    const srv = store.getServer(id);
-    if (!srv) return res.status(404).json({ error: true, message: 'Server not found' });
-
+  app.post('/api/servers', (req: Request, res: Response, next: NextFunction) => {
     try {
-      await stopServerProcess(id);
-    } catch {}
-    try {
-      killTerminalCommand(id);
-    } catch {}
+      const { name, description, port, entry_file, auto_restart, env_vars, template } = req.body || {};
+      const cleanName = typeof name === 'string' ? name.trim() : '';
+      if (!cleanName || cleanName.length > 64) {
+        return res.status(400).json({
+          error: true,
+          code: 'INVALID_NAME',
+          message: 'Server name is required (1–64 characters)',
+        });
+      }
 
-    store.deleteServer(id);
-    serverWorkingDirs.delete(id);
-    const srvDir = path.join(SERVERS_DIR, id);
-    try {
-      fs.rmSync(srvDir, { recursive: true, force: true });
-    } catch {}
+      let assignedPort = findAvailablePort(3001);
+      if (port !== undefined && port !== null && port !== '') {
+        const parsedPort = Number(port);
+        if (!Number.isInteger(parsedPort) || parsedPort < 1024 || parsedPort > 65535 || parsedPort === 3000) {
+          return res.status(400).json({
+            error: true,
+            code: 'INVALID_PORT',
+            message: 'Port must be an integer between 1024 and 65535 (excluding reserved port 3000)',
+          });
+        }
+        assignedPort = parsedPort;
+      }
 
-    store.recordActivity('delete_server', id, `Deleted server '${srv.name}'`, 'success');
-    res.json({ success: true });
-  });
+      const serverId = `srv-${Math.floor(Date.now() / 1000) % 100000}-${crypto.randomBytes(4).toString('hex')}`;
+      const srvDir = safeResolveServerPath(serverId, '');
+      fs.mkdirSync(srvDir, { recursive: true });
 
-  // Server Process Controls
-  app.post('/api/servers/:id/start', async (req: Request, res: Response) => {
-    const id = req.params.id;
-    try {
-      await startServerProcess(id);
-      res.json({ success: true, status: 'starting' });
-    } catch (err: any) {
-      res.status(400).json({ error: true, message: err.message || 'Failed to start server' });
+      let validatedEntry: string;
+      try {
+        validatedEntry = validateEntryCommand(serverId, typeof entry_file === 'string' ? entry_file : 'index.js').cleanEntry;
+      } catch (err) {
+        fs.rmSync(srvDir, { recursive: true, force: true });
+        throw err;
+      }
+
+      seedServerTemplate(srvDir, typeof template === 'string' ? template : 'blank', cleanName, assignedPort);
+
+      const safeEnv: Record<string, string> = {};
+      if (env_vars && typeof env_vars === 'object') {
+        for (const [k, v] of Object.entries(env_vars)) {
+          const key = k.trim();
+          if (SAFE_ENV_KEY_REGEX.test(key)) {
+            safeEnv[key] = String(v ?? '');
+          }
+        }
+      }
+      safeEnv.PORT = String(assignedPort);
+      safeEnv.NODE_ENV = safeEnv.NODE_ENV || 'production';
+
+      const nowIso = new Date().toISOString();
+      const srv: ServerModel = {
+        id: serverId,
+        name: cleanName,
+        description: typeof description === 'string' ? description.trim().slice(0, 300) : '',
+        port: assignedPort,
+        entry_file: validatedEntry,
+        start_script: 'start',
+        status: 'created',
+        auto_restart: autoRestartPolicyValid(auto_restart) ? auto_restart : 'never',
+        env_vars: safeEnv,
+        created_at: nowIso,
+        updated_at: nowIso,
+        last_exit_code: 0,
+        metrics: {
+          pid: 0,
+          status: 'created',
+          uptime_sec: 0,
+          memory_mb: 0,
+          cpu_percent: 0,
+        },
+      };
+
+      store.saveServer(srv);
+      store.recordActivity(
+        'create_server',
+        serverId,
+        `Created server '${cleanName}' on port ${assignedPort}`,
+        'success'
+      );
+
+      return res.status(201).json(srv);
+    } catch (err) {
+      next(err);
     }
   });
 
-  app.post('/api/servers/:id/stop', async (req: Request, res: Response) => {
-    const id = req.params.id;
+  // Server Details, Update, & Delete
+  app.get('/api/servers/:id', (req: Request, res: Response, next: NextFunction) => {
     try {
-      await stopServerProcess(id);
-      store.recordActivity('stop_server', id, 'Server stopped gracefully', 'success');
-      res.json({ success: true, status: 'stopping' });
-    } catch (err: any) {
-      res.status(400).json({ error: true, message: err.message || 'Failed to stop server' });
-    }
-  });
+      const id = String(req.params.id);
+      assertValidServerId(id);
+      const srv = store.getServer(id);
+      if (!srv) {
+        return res.status(404).json({ error: true, code: 'SERVER_NOT_FOUND', message: 'Server not found' });
+      }
 
-  app.post('/api/servers/:id/restart', async (req: Request, res: Response) => {
-    const id = req.params.id;
-    try {
-      await stopServerProcess(id);
-      await new Promise((r) => setTimeout(r, 400));
-      await startServerProcess(id);
-      store.recordActivity('restart_server', id, 'Server restarted', 'success');
-      res.json({ success: true, status: 'restarting' });
-    } catch (err: any) {
-      res.status(400).json({ error: true, message: err.message || 'Failed to restart server' });
-    }
-  });
+      const ap = activeProcesses.get(srv.id);
+      const recentLogs = ap ? [...ap.logs] : readServerLogsFromFile(srv.id);
 
-  app.post('/api/servers/:id/install', async (req: Request, res: Response) => {
-    const id = req.params.id;
-    const srv = store.getServer(id);
-    if (!srv) return res.status(404).json({ error: true, message: 'Server not found' });
-
-    const srvDir = path.join(SERVERS_DIR, id);
-    try {
-      updateServerStatus(id, 'installing', 0);
-      const output = execSync('npm install --no-audit --no-fund', {
-        cwd: srvDir,
-        encoding: 'utf-8',
-        timeout: 600000,
+      return res.json({
+        ...srv,
+        metrics: getProcessMetrics(srv.id),
+        recent_logs: recentLogs,
       });
-      updateServerStatus(id, 'stopped', 0);
-      res.json({ success: true, output });
-    } catch (err: any) {
-      updateServerStatus(id, 'stopped', 1);
-      res.status(400).json({ success: false, error: err.message, output: err.stdout || err.message });
+    } catch (err) {
+      next(err);
     }
   });
 
-  function readServerLogsFromFile(serverId: string): LogLine[] {
-    const logFile = path.join(SERVERS_DIR, serverId, 'logs', 'server.log');
-    if (!fs.existsSync(logFile)) return [];
+  app.put('/api/servers/:id', (req: Request, res: Response, next: NextFunction) => {
     try {
-      const content = fs.readFileSync(logFile, 'utf-8');
-      const lines = content.split('\n').filter((l) => l.trim().length > 0);
-      return lines.map((l) => ({
-        timestamp: new Date().toISOString(),
-        stream: 'file',
-        text: l,
-      }));
-    } catch {
-      return [];
-    }
-  }
+      const id = String(req.params.id);
+      assertValidServerId(id);
+      const srv = store.getServer(id);
+      if (!srv) {
+        return res.status(404).json({ error: true, code: 'SERVER_NOT_FOUND', message: 'Server not found' });
+      }
 
-  app.get('/api/servers/:id/logs', (req: Request, res: Response) => {
-    const id = req.params.id;
-    const ap = activeProcesses.get(id);
-    const logs = ap ? [...ap.logs] : readServerLogsFromFile(id);
-    res.json(logs);
+      const { name, description, port, entry_file, auto_restart, env_vars } = req.body || {};
+
+      if (name !== undefined) {
+        const cleanName = typeof name === 'string' ? name.trim() : '';
+        if (!cleanName || cleanName.length > 64) {
+          return res.status(400).json({
+            error: true,
+            code: 'INVALID_NAME',
+            message: 'Server name must be between 1 and 64 characters',
+          });
+        }
+        srv.name = cleanName;
+      }
+
+      if (description !== undefined && typeof description === 'string') {
+        srv.description = description.trim().slice(0, 300);
+      }
+
+      if (port !== undefined) {
+        const parsedPort = Number(port);
+        if (!Number.isInteger(parsedPort) || parsedPort < 1024 || parsedPort > 65535 || parsedPort === 3000) {
+          return res.status(400).json({
+            error: true,
+            code: 'INVALID_PORT',
+            message: 'Port must be an integer between 1024 and 65535 (excluding 3000)',
+          });
+        }
+        srv.port = parsedPort;
+      }
+
+      if (entry_file !== undefined) {
+        if (typeof entry_file !== 'string') {
+          return res.status(400).json({ error: true, code: 'INVALID_ENTRY', message: 'Invalid entry_file' });
+        }
+        srv.entry_file = validateEntryCommand(id, entry_file).cleanEntry;
+      }
+
+      if (auto_restart !== undefined) {
+        if (!autoRestartPolicyValid(auto_restart)) {
+          return res.status(400).json({
+            error: true,
+            code: 'INVALID_RESTART_POLICY',
+            message: 'auto_restart must be never, on-failure, or always',
+          });
+        }
+        srv.auto_restart = auto_restart;
+      }
+
+      if (env_vars && typeof env_vars === 'object') {
+        const safeEnv: Record<string, string> = {};
+        for (const [k, v] of Object.entries(env_vars)) {
+          const cleanKey = k.trim();
+          if (SAFE_ENV_KEY_REGEX.test(cleanKey)) {
+            safeEnv[cleanKey] = String(v ?? '');
+          }
+        }
+        srv.env_vars = safeEnv;
+      }
+
+      store.saveServer(srv);
+      store.recordActivity('update_server', id, `Updated configuration for '${srv.name}'`, 'success');
+      return res.json({
+        ...srv,
+        metrics: getProcessMetrics(srv.id),
+      });
+    } catch (err) {
+      next(err);
+    }
+  });
+
+  app.delete('/api/servers/:id', async (req: Request, res: Response, next: NextFunction) => {
+    try {
+      const id = String(req.params.id);
+      assertValidServerId(id);
+      const srv = store.getServer(id);
+      if (!srv) {
+        return res.status(404).json({ error: true, code: 'SERVER_NOT_FOUND', message: 'Server not found' });
+      }
+
+      await withServerLock(id, async () => {
+        clearSupervisorTimers(id, true);
+        await stopServerProcessInternal(id);
+        killTerminalCommand(id);
+
+        const srvDir = safeResolveServerPath(id, '');
+        store.deleteServer(id);
+        supervisorStates.delete(id);
+        serverWorkingDirs.delete(id);
+
+        try {
+          fs.rmSync(srvDir, { recursive: true, force: true });
+        } catch {
+          // Ignore cleanup errors
+        }
+      });
+
+      store.recordActivity('delete_server', id, `Deleted server '${srv.name}'`, 'success');
+      return res.json({ success: true });
+    } catch (err) {
+      next(err);
+    }
+  });
+
+  // Serialized Server Process Lifecycle Controls
+  app.post('/api/servers/:id/start', async (req: Request, res: Response, next: NextFunction) => {
+    try {
+      const id = String(req.params.id);
+      assertValidServerId(id);
+      await withServerLock(id, () => startServerProcessInternal(id, false));
+      return res.json({ success: true, status: 'running' });
+    } catch (err) {
+      next(err);
+    }
+  });
+
+  app.post('/api/servers/:id/stop', async (req: Request, res: Response, next: NextFunction) => {
+    try {
+      const id = String(req.params.id);
+      assertValidServerId(id);
+      if (!store.getServer(id)) {
+        return res.status(404).json({ error: true, code: 'SERVER_NOT_FOUND', message: 'Server not found' });
+      }
+      await withServerLock(id, () => stopServerProcessInternal(id));
+      store.recordActivity('stop_server', id, 'Server stopped gracefully', 'success');
+      return res.json({ success: true, status: 'stopped' });
+    } catch (err) {
+      next(err);
+    }
+  });
+
+  app.post('/api/servers/:id/restart', async (req: Request, res: Response, next: NextFunction) => {
+    try {
+      const id = String(req.params.id);
+      assertValidServerId(id);
+      if (!store.getServer(id)) {
+        return res.status(404).json({ error: true, code: 'SERVER_NOT_FOUND', message: 'Server not found' });
+      }
+      await withServerLock(id, async () => {
+        await stopServerProcessInternal(id);
+        await new Promise((r) => setTimeout(r, 250));
+        await startServerProcessInternal(id, false);
+      });
+      store.recordActivity('restart_server', id, 'Server restarted cleanly', 'success');
+      return res.json({ success: true, status: 'running' });
+    } catch (err) {
+      next(err);
+    }
+  });
+
+  app.post('/api/servers/:id/install', async (req: Request, res: Response, next: NextFunction) => {
+    try {
+      const id = String(req.params.id);
+      assertValidServerId(id);
+      const srv = store.getServer(id);
+      if (!srv) {
+        return res.status(404).json({ error: true, code: 'SERVER_NOT_FOUND', message: 'Server not found' });
+      }
+
+      const srvDir = safeResolveServerPath(id, '');
+      const result = await withServerLock(id, async () => {
+        const wasRunning = activeProcesses.has(id);
+        if (!wasRunning) {
+          updateServerStatus(id, 'installing', 0);
+        }
+        try {
+          const resOut = await runCommandAsync('npm', ['install', '--no-audit', '--no-fund'], {
+            cwd: srvDir,
+            timeoutMs: 300_000,
+          });
+          if (!activeProcesses.has(id)) {
+            updateServerStatus(id, 'stopped', 0);
+          }
+          store.recordActivity('npm_install', id, `Installed npm dependencies for '${srv.name}'`, 'success');
+          return resOut;
+        } catch (installErr: unknown) {
+          if (!activeProcesses.has(id)) {
+            updateServerStatus(id, 'stopped', 1);
+          }
+          throw installErr;
+        }
+      });
+
+      return res.json({ success: true, output: result.output });
+    } catch (err) {
+      next(err);
+    }
+  });
+
+  app.get('/api/servers/:id/logs', (req: Request, res: Response, next: NextFunction) => {
+    try {
+      const id = String(req.params.id);
+      assertValidServerId(id);
+      if (!store.getServer(id)) {
+        return res.status(404).json({ error: true, code: 'SERVER_NOT_FOUND', message: 'Server not found' });
+      }
+      const ap = activeProcesses.get(id);
+      const logs = ap ? [...ap.logs] : readServerLogsFromFile(id);
+      return res.json(logs);
+    } catch (err) {
+      next(err);
+    }
   });
 
   // --- Environment Auto-detection & Storage (.env.example & .env) ---
-  app.get('/api/servers/:id/env', (req: Request, res: Response) => {
-    const id = req.params.id;
-    const srv = store.getServer(id);
-    if (!srv) return res.status(404).json({ error: true, message: 'Server not found' });
+  app.get('/api/servers/:id/env', (req: Request, res: Response, next: NextFunction) => {
+    try {
+      const id = String(req.params.id);
+      assertValidServerId(id);
+      const srv = store.getServer(id);
+      if (!srv) {
+        return res.status(404).json({ error: true, code: 'SERVER_NOT_FOUND', message: 'Server not found' });
+      }
 
-    const srvDir = path.join(SERVERS_DIR, id);
-    const examplePath = path.join(srvDir, '.env.example');
-    const actualEnvPath = path.join(srvDir, '.env');
+      const examplePath = safeResolveServerPath(id, '.env.example');
+      const actualEnvPath = safeResolveServerPath(id, '.env');
 
-    const hasExample = fs.existsSync(examplePath);
-    const hasEnv = fs.existsSync(actualEnvPath);
+      const hasExample = fs.existsSync(examplePath);
+      const hasEnv = fs.existsSync(actualEnvPath);
 
-    let exampleRaw = '';
-    let envRaw = '';
+      let exampleRaw = '';
+      let envRaw = '';
 
-    const exampleVars = new Map<string, { exampleValue: string; comment: string }>();
-    const actualVars = new Map<string, string>();
+      const exampleVars = new Map<string, { exampleValue: string; comment: string }>();
+      const actualVars = new Map<string, string>();
 
-    // Parse .env.example
-    if (hasExample) {
-      try {
-        exampleRaw = fs.readFileSync(examplePath, 'utf-8');
-        let pendingComment = '';
-        for (const line of exampleRaw.split('\n')) {
-          const trimmed = line.trim();
-          if (trimmed.startsWith('#')) {
-            pendingComment = (pendingComment ? `${pendingComment} ` : '') + trimmed.replace(/^#+\s*/, '');
-            continue;
-          }
-          if (!trimmed) {
-            pendingComment = '';
-            continue;
-          }
-          const eqIdx = trimmed.indexOf('=');
-          if (eqIdx > 0) {
-            const key = trimmed.substring(0, eqIdx).trim();
-            let val = trimmed.substring(eqIdx + 1).trim();
-            // strip inline comment if any
-            const hashIdx = val.indexOf('#');
-            if (hashIdx >= 0 && !val.startsWith('"') && !val.startsWith("'")) {
-              val = val.substring(0, hashIdx).trim();
+      if (hasExample) {
+        try {
+          exampleRaw = fs.readFileSync(examplePath, 'utf-8');
+          let pendingComment = '';
+          for (const line of exampleRaw.split('\n')) {
+            const trimmed = line.trim();
+            if (trimmed.startsWith('#')) {
+              pendingComment =
+                (pendingComment ? `${pendingComment} ` : '') + trimmed.replace(/^#+\s*/, '');
+              continue;
             }
-            if ((val.startsWith('"') && val.endsWith('"')) || (val.startsWith("'") && val.endsWith("'"))) {
-              val = val.substring(1, val.length - 1);
+            if (!trimmed) {
+              pendingComment = '';
+              continue;
             }
-            exampleVars.set(key, { exampleValue: val, comment: pendingComment });
-            pendingComment = '';
+            const eqIdx = trimmed.indexOf('=');
+            if (eqIdx > 0) {
+              const key = trimmed.substring(0, eqIdx).trim();
+              let val = trimmed.substring(eqIdx + 1).trim();
+              const hashIdx = val.indexOf('#');
+              if (hashIdx >= 0 && !val.startsWith('"') && !val.startsWith("'")) {
+                val = val.substring(0, hashIdx).trim();
+              }
+              if ((val.startsWith('"') && val.endsWith('"')) || (val.startsWith("'") && val.endsWith("'"))) {
+                val = val.substring(1, val.length - 1);
+              }
+              exampleVars.set(key, { exampleValue: val, comment: pendingComment });
+              pendingComment = '';
+            }
           }
+        } catch {
+          // Ignore read error
         }
-      } catch {}
-    }
+      }
 
-    // Parse .env
-    if (hasEnv) {
-      try {
-        envRaw = fs.readFileSync(actualEnvPath, 'utf-8');
-        for (const line of envRaw.split('\n')) {
-          const trimmed = line.trim();
-          if (!trimmed || trimmed.startsWith('#')) continue;
-          const eqIdx = trimmed.indexOf('=');
-          if (eqIdx > 0) {
-            const key = trimmed.substring(0, eqIdx).trim();
-            let val = trimmed.substring(eqIdx + 1).trim();
-            if ((val.startsWith('"') && val.endsWith('"')) || (val.startsWith("'") && val.endsWith("'"))) {
-              val = val.substring(1, val.length - 1);
+      if (hasEnv) {
+        try {
+          envRaw = fs.readFileSync(actualEnvPath, 'utf-8');
+          for (const line of envRaw.split('\n')) {
+            const trimmed = line.trim();
+            if (!trimmed || trimmed.startsWith('#')) continue;
+            const eqIdx = trimmed.indexOf('=');
+            if (eqIdx > 0) {
+              const key = trimmed.substring(0, eqIdx).trim();
+              let val = trimmed.substring(eqIdx + 1).trim();
+              if ((val.startsWith('"') && val.endsWith('"')) || (val.startsWith("'") && val.endsWith("'"))) {
+                val = val.substring(1, val.length - 1);
+              }
+              actualVars.set(key, val);
             }
-            actualVars.set(key, val);
           }
+        } catch {
+          // Ignore read error
         }
-      } catch {}
-    } else {
-      // Fallback to srv.env_vars if .env file not created yet
-      if (srv.env_vars) {
+      } else if (srv.env_vars) {
         for (const [k, v] of Object.entries(srv.env_vars)) {
           actualVars.set(k, v);
         }
       }
-    }
 
-    // Combine variables
-    const variables: Array<{
-      key: string;
-      value: string;
-      example_value?: string;
-      comment?: string;
-      source: 'both' | 'example' | 'custom';
-    }> = [];
+      const variables: Array<{
+        key: string;
+        value: string;
+        example_value?: string;
+        comment?: string;
+        source: 'both' | 'example' | 'custom';
+      }> = [];
 
-    const processedKeys = new Set<string>();
+      const processedKeys = new Set<string>();
 
-    // 1. Keys from .env.example
-    for (const [key, meta] of exampleVars.entries()) {
-      processedKeys.add(key);
-      const inActual = actualVars.has(key);
-      const actualVal = inActual ? actualVars.get(key)! : '';
-      // If actual value is empty or .env doesn't exist yet, auto-propose exampleValue
-      const proposedVal = actualVal !== '' ? actualVal : (meta.exampleValue || '');
-
-      variables.push({
-        key,
-        value: proposedVal,
-        example_value: meta.exampleValue,
-        comment: meta.comment,
-        source: inActual ? 'both' : 'example',
-      });
-    }
-
-    // 2. Custom keys in .env not in .env.example
-    for (const [key, val] of actualVars.entries()) {
-      if (!processedKeys.has(key)) {
+      for (const [key, meta] of exampleVars.entries()) {
         processedKeys.add(key);
+        const inActual = actualVars.has(key);
+        const actualVal = inActual ? actualVars.get(key)! : '';
+        const proposedVal = actualVal !== '' ? actualVal : meta.exampleValue || '';
+
         variables.push({
           key,
-          value: val,
-          source: 'custom',
+          value: proposedVal,
+          example_value: meta.exampleValue,
+          comment: meta.comment,
+          source: inActual ? 'both' : 'example',
         });
       }
-    }
 
-    res.json({
-      has_example: hasExample,
-      has_env: hasEnv,
-      variables,
-      example_raw: exampleRaw,
-      env_raw: envRaw,
-    });
+      for (const [key, val] of actualVars.entries()) {
+        if (!processedKeys.has(key)) {
+          processedKeys.add(key);
+          variables.push({
+            key,
+            value: val,
+            source: 'custom',
+          });
+        }
+      }
+
+      return res.json({
+        has_example: hasExample,
+        has_env: hasEnv,
+        variables,
+        example_raw: exampleRaw,
+        env_raw: envRaw,
+      });
+    } catch (err) {
+      next(err);
+    }
   });
 
-  app.post('/api/servers/:id/env', (req: Request, res: Response) => {
-    const id = req.params.id;
-    const srv = store.getServer(id);
-    if (!srv) return res.status(404).json({ error: true, message: 'Server not found' });
-
-    const { variables } = req.body;
-    if (!variables || typeof variables !== 'object') {
-      return res.status(400).json({ error: true, message: 'variables object required' });
-    }
-
-    const srvDir = path.join(SERVERS_DIR, id);
-    const actualEnvPath = path.join(srvDir, '.env');
-
-    // Build .env file content
-    const lines: string[] = [
-      `# Environment Configuration for ${srv.name}`,
-      `# Updated at: ${new Date().toISOString()}`,
-      '',
-    ];
-
-    const cleanVars: Record<string, string> = {};
-    for (const [k, v] of Object.entries(variables)) {
-      const cleanKey = k.trim();
-      if (!cleanKey) continue;
-      const cleanVal = String(v ?? '');
-      cleanVars[cleanKey] = cleanVal;
-
-      // Escape quotes or wrap in quotes if spaces
-      let formattedVal = cleanVal;
-      if (cleanVal.includes(' ') || cleanVal.includes('\n') || cleanVal.includes('"')) {
-        formattedVal = `"${cleanVal.replace(/"/g, '\\"')}"`;
-      }
-      lines.push(`${cleanKey}=${formattedVal}`);
-    }
-
+  app.post('/api/servers/:id/env', (req: Request, res: Response, next: NextFunction) => {
     try {
-      fs.writeFileSync(actualEnvPath, lines.join('\n') + '\n', 'utf-8');
+      const id = String(req.params.id);
+      assertValidServerId(id);
+      const srv = store.getServer(id);
+      if (!srv) {
+        return res.status(404).json({ error: true, code: 'SERVER_NOT_FOUND', message: 'Server not found' });
+      }
 
-      // Update in-memory and nodepanel.json server env_vars
+      const { variables } = req.body || {};
+      if (!variables || typeof variables !== 'object' || Array.isArray(variables)) {
+        return res.status(400).json({
+          error: true,
+          code: 'INVALID_ENV_PAYLOAD',
+          message: 'variables dictionary object is required',
+        });
+      }
+
+      const srvDir = safeResolveServerPath(id, '');
+      fs.mkdirSync(srvDir, { recursive: true });
+      const actualEnvPath = safeResolveServerPath(id, '.env');
+
+      const lines: string[] = [
+        `# Environment Configuration for ${srv.name}`,
+        `# Updated at: ${new Date().toISOString()}`,
+        '',
+      ];
+
+      const cleanVars: Record<string, string> = {};
+      for (const [k, v] of Object.entries(variables)) {
+        const cleanKey = k.trim();
+        if (!cleanKey) continue;
+        if (!SAFE_ENV_KEY_REGEX.test(cleanKey)) {
+          return res.status(400).json({
+            error: true,
+            code: 'INVALID_ENV_KEY',
+            message: `Invalid environment variable key '${cleanKey}'`,
+          });
+        }
+        const cleanVal = String(v ?? '').replace(/\0/g, '');
+        cleanVars[cleanKey] = cleanVal;
+
+        let formattedVal = cleanVal;
+        if (cleanVal.includes(' ') || cleanVal.includes('\n') || cleanVal.includes('"') || cleanVal.includes('#')) {
+          formattedVal = `"${cleanVal.replace(/\\/g, '\\\\').replace(/"/g, '\\"').replace(/\n/g, '\\n')}"`;
+        }
+        lines.push(`${cleanKey}=${formattedVal}`);
+      }
+
+      const tmpEnv = `${actualEnvPath}.tmp.${crypto.randomUUID()}`;
+      fs.writeFileSync(tmpEnv, lines.join('\n') + '\n', 'utf-8');
+      fs.renameSync(tmpEnv, actualEnvPath);
+
       srv.env_vars = cleanVars;
       store.saveServer(srv);
+      store.recordActivity(
+        'update_env',
+        id,
+        `Updated environment variables (${Object.keys(cleanVars).length} entries)`,
+        'success'
+      );
 
-      store.recordActivity('update_env', id, `Updated environment variables (${Object.keys(cleanVars).length} entries)`, 'success');
-      res.json({ success: true, count: Object.keys(cleanVars).length });
-    } catch (err: any) {
-      res.status(500).json({ error: true, message: `Failed to save .env file: ${err.message}` });
+      return res.json({ success: true, count: Object.keys(cleanVars).length });
+    } catch (err) {
+      next(err);
     }
   });
 
-  app.post('/api/servers/:id/env/init-example', (req: Request, res: Response) => {
-    const id = req.params.id;
-    const srv = store.getServer(id);
-    if (!srv) return res.status(404).json({ error: true, message: 'Server not found' });
+  app.post('/api/servers/:id/env/init-example', (req: Request, res: Response, next: NextFunction) => {
+    try {
+      const id = String(req.params.id);
+      assertValidServerId(id);
+      const srv = store.getServer(id);
+      if (!srv) {
+        return res.status(404).json({ error: true, code: 'SERVER_NOT_FOUND', message: 'Server not found' });
+      }
 
-    const srvDir = path.join(SERVERS_DIR, id);
-    const examplePath = path.join(srvDir, '.env.example');
+      const srvDir = safeResolveServerPath(id, '');
+      fs.mkdirSync(srvDir, { recursive: true });
+      const examplePath = safeResolveServerPath(id, '.env.example');
 
-    if (fs.existsSync(examplePath)) {
-      return res.json({ success: true, message: '.env.example already exists' });
-    }
+      if (fs.existsSync(examplePath)) {
+        return res.json({ success: true, message: '.env.example already exists' });
+      }
 
-    const templateContent = `# Server Listening Port
+      const templateContent = `# Server Listening Port
 PORT=${srv.port || 3001}
 
 # Application Environment Mode (development / production)
@@ -1704,56 +2770,87 @@ DATABASE_URL=
 API_SECRET_KEY=
 `;
 
-    try {
       fs.writeFileSync(examplePath, templateContent, 'utf-8');
       store.recordActivity('init_env_example', id, 'Initialized .env.example template', 'success');
-      res.json({ success: true });
-    } catch (err: any) {
-      res.status(500).json({ error: true, message: err.message });
+      return res.json({ success: true });
+    } catch (err) {
+      next(err);
     }
   });
 
-  // --- Terminal REST Fallbacks ---
-  app.get('/api/servers/:id/terminal/info', (req: Request, res: Response) => {
-    const id = req.params.id;
-    const active = activeTerminals.get(id);
-    const root = path.resolve(SERVERS_DIR, id);
-    const cwd = getServerWorkingDir(id);
-    const rel = path.relative(root, cwd) || '.';
-
-    res.json({
-      isRunning: Boolean(active),
-      currentCommand: active ? active.command : '',
-      cwd: rel,
-    });
-  });
-
-  app.post('/api/servers/:id/terminal/exec', (req: Request, res: Response) => {
-    const id = req.params.id;
-    const { command } = req.body;
-    if (!command) return res.status(400).json({ error: true, message: 'command required' });
-
-    executeTerminalCommand(id, command);
-    res.json({ success: true });
-  });
-
-  app.post('/api/servers/:id/terminal/kill', (req: Request, res: Response) => {
-    const id = req.params.id;
-    killTerminalCommand(id);
-    res.json({ success: true });
-  });
-
-  // --- Server Files & File Manager Operations ---
-  app.get('/api/servers/:id/files', (req: Request, res: Response) => {
-    const id = req.params.id;
-    const relPath = (req.query.path as string) || '';
-    const isContent = req.query.content === 'true';
-
+  // --- Terminal REST Endpoints ---
+  app.get('/api/servers/:id/terminal/info', (req: Request, res: Response, next: NextFunction) => {
     try {
+      const id = String(req.params.id);
+      assertValidServerId(id);
+      if (!store.getServer(id)) {
+        return res.status(404).json({ error: true, code: 'SERVER_NOT_FOUND', message: 'Server not found' });
+      }
+      const active = activeTerminals.get(id);
+      const root = fs.realpathSync(safeResolveServerPath(id, ''));
+      const cwd = getServerWorkingDir(id);
+      const rel = path.relative(root, cwd) || '.';
+
+      return res.json({
+        isRunning: Boolean(active),
+        currentCommand: active ? active.command : '',
+        cwd: rel,
+      });
+    } catch (err) {
+      next(err);
+    }
+  });
+
+  app.post('/api/servers/:id/terminal/exec', (req: Request, res: Response, next: NextFunction) => {
+    try {
+      const id = String(req.params.id);
+      assertValidServerId(id);
+      const command = typeof req.body?.command === 'string' ? req.body.command.trim() : '';
+      if (!command) {
+        return res.status(400).json({ error: true, code: 'MISSING_COMMAND', message: 'command is required' });
+      }
+      executeTerminalCommand(id, command);
+      return res.json({ success: true });
+    } catch (err) {
+      next(err);
+    }
+  });
+
+  app.post('/api/servers/:id/terminal/kill', (req: Request, res: Response, next: NextFunction) => {
+    try {
+      const id = String(req.params.id);
+      assertValidServerId(id);
+      killTerminalCommand(id);
+      return res.json({ success: true });
+    } catch (err) {
+      next(err);
+    }
+  });
+
+  // --- Server Files & Sandboxed File Manager Operations ---
+  app.get('/api/servers/:id/files', (req: Request, res: Response, next: NextFunction) => {
+    try {
+      const id = String(req.params.id);
+      const relPath = typeof req.query.path === 'string' ? req.query.path : '';
+      const isContent = req.query.content === 'true';
+
+      if (!store.getServer(id)) {
+        assertValidServerId(id);
+        return res.status(404).json({ error: true, code: 'SERVER_NOT_FOUND', message: 'Server not found' });
+      }
+
       const target = safeResolveServerPath(id, relPath);
       if (isContent) {
         if (!fs.existsSync(target) || fs.statSync(target).isDirectory()) {
-          return res.status(404).json({ error: true, message: 'File not found' });
+          return res.status(404).json({ error: true, code: 'FILE_NOT_FOUND', message: 'File not found' });
+        }
+        const stat = fs.statSync(target);
+        if (stat.size > 2 * 1024 * 1024) {
+          return res.status(413).json({
+            error: true,
+            code: 'FILE_TOO_LARGE',
+            message: 'File exceeds 2 MB editor limit; download the file instead.',
+          });
         }
         const content = fs.readFileSync(target, 'utf-8');
         return res.json({ path: relPath, content });
@@ -1763,241 +2860,511 @@ API_SECRET_KEY=
         return res.json([]);
       }
 
-      const root = path.resolve(SERVERS_DIR, id);
+      const root = safeResolveServerPath(id, '');
       const dirEntries = fs.readdirSync(target, { withFileTypes: true });
       const files: FileEntry[] = dirEntries.map((ent) => {
         const fullChild = path.join(target, ent.name);
-        let stat: fs.Stats;
+        let size = 0;
+        let modTime = new Date().toISOString();
+        let isDir = ent.isDirectory();
         try {
-          stat = fs.statSync(fullChild);
+          const lstat = fs.lstatSync(fullChild);
+          size = lstat.size;
+          modTime = lstat.mtime.toISOString();
+          isDir = lstat.isDirectory();
         } catch {
-          stat = { size: 0, mtime: new Date() } as any;
+          // Ignore transient stat error
         }
-        const relFromRoot = path.relative(root, fullChild);
+        const relFromRoot = path.relative(root, fullChild).split(path.sep).join('/');
         return {
           name: ent.name,
           path: relFromRoot,
-          is_dir: ent.isDirectory(),
-          size: stat.size,
-          mod_time: stat.mtime.toISOString(),
+          is_dir: isDir,
+          size,
+          mod_time: modTime,
         };
       });
 
-      // Sort folders first, then alphabetically
       files.sort((a, b) => {
         if (a.is_dir && !b.is_dir) return -1;
         if (!a.is_dir && b.is_dir) return 1;
         return a.name.localeCompare(b.name);
       });
 
-      res.json(files);
-    } catch (err: any) {
-      res.status(400).json({ error: true, message: err.message });
+      return res.json(files);
+    } catch (err) {
+      next(err);
     }
   });
 
-  app.post('/api/servers/:id/files', (req: Request, res: Response) => {
-    const id = req.params.id;
-    const { path: filePath, content } = req.body;
-    if (!filePath) return res.status(400).json({ error: true, message: 'path is required' });
-
+  app.post('/api/servers/:id/files', (req: Request, res: Response, next: NextFunction) => {
     try {
+      const id = String(req.params.id);
+      assertValidServerId(id);
+      if (!store.getServer(id)) {
+        return res.status(404).json({ error: true, code: 'SERVER_NOT_FOUND', message: 'Server not found' });
+      }
+      const filePath = typeof req.body?.path === 'string' ? req.body.path.trim() : '';
+      const content = typeof req.body?.content === 'string' ? req.body.content : '';
+      if (!filePath) {
+        return res.status(400).json({ error: true, code: 'INVALID_PATH', message: 'path is required' });
+      }
+
+      const root = safeResolveServerPath(id, '');
       const target = safeResolveServerPath(id, filePath);
+      if (target === root) {
+        return res.status(400).json({
+          error: true,
+          code: 'INVALID_PATH',
+          message: 'Cannot overwrite server root directory',
+        });
+      }
+
       fs.mkdirSync(path.dirname(target), { recursive: true });
-      fs.writeFileSync(target, content || '', 'utf-8');
-      res.json({ success: true });
-    } catch (err: any) {
-      res.status(400).json({ error: true, message: err.message });
+      fs.writeFileSync(target, content, 'utf-8');
+      store.recordActivity('write_file', id, `Saved file ${filePath}`, 'success');
+      return res.json({ success: true });
+    } catch (err) {
+      next(err);
     }
   });
 
-  app.delete('/api/servers/:id/files', (req: Request, res: Response) => {
-    const id = req.params.id;
-    const filePath = req.query.path as string;
-    if (!filePath) return res.status(400).json({ error: true, message: 'path is required' });
-
+  app.delete('/api/servers/:id/files', (req: Request, res: Response, next: NextFunction) => {
     try {
+      const id = String(req.params.id);
+      assertValidServerId(id);
+      if (!store.getServer(id)) {
+        return res.status(404).json({ error: true, code: 'SERVER_NOT_FOUND', message: 'Server not found' });
+      }
+      const filePath = typeof req.query.path === 'string' ? req.query.path.trim() : '';
+      if (!filePath) {
+        return res.status(400).json({ error: true, code: 'INVALID_PATH', message: 'path is required' });
+      }
+
+      const root = safeResolveServerPath(id, '');
       const target = safeResolveServerPath(id, filePath);
+      if (target === root) {
+        return res.status(400).json({
+          error: true,
+          code: 'PROTECTED_ROOT',
+          message: 'Cannot delete server root workspace',
+        });
+      }
+
       if (fs.existsSync(target)) {
         fs.rmSync(target, { recursive: true, force: true });
+        store.recordActivity('delete_file', id, `Deleted ${filePath}`, 'success');
       }
-      res.json({ success: true });
-    } catch (err: any) {
-      res.status(400).json({ error: true, message: err.message });
+      return res.json({ success: true });
+    } catch (err) {
+      next(err);
     }
   });
 
-  // Rename file or folder
-  app.post('/api/servers/:id/files/rename', (req: Request, res: Response) => {
-    const id = req.params.id;
-    const { old_path, new_path } = req.body;
-    if (!old_path || !new_path) {
-      return res.status(400).json({ error: true, message: 'old_path and new_path are required' });
-    }
-
+  app.post('/api/servers/:id/files/rename', (req: Request, res: Response, next: NextFunction) => {
     try {
-      const oldTarget = safeResolveServerPath(id, old_path);
-      const newTarget = safeResolveServerPath(id, new_path);
+      const id = String(req.params.id);
+      assertValidServerId(id);
+      if (!store.getServer(id)) {
+        return res.status(404).json({ error: true, code: 'SERVER_NOT_FOUND', message: 'Server not found' });
+      }
+      const oldPath = typeof req.body?.old_path === 'string' ? req.body.old_path.trim() : '';
+      const newPath = typeof req.body?.new_path === 'string' ? req.body.new_path.trim() : '';
+      if (!oldPath || !newPath) {
+        return res.status(400).json({
+          error: true,
+          code: 'INVALID_PATH',
+          message: 'old_path and new_path are required',
+        });
+      }
+
+      const root = safeResolveServerPath(id, '');
+      const oldTarget = safeResolveServerPath(id, oldPath);
+      const newTarget = safeResolveServerPath(id, newPath);
+      if (oldTarget === root || newTarget === root) {
+        return res.status(400).json({ error: true, code: 'PROTECTED_ROOT', message: 'Cannot rename root directory' });
+      }
 
       if (!fs.existsSync(oldTarget)) {
-        return res.status(404).json({ error: true, message: 'Source file does not exist' });
+        return res.status(404).json({ error: true, code: 'FILE_NOT_FOUND', message: 'Source path does not exist' });
       }
 
+      fs.mkdirSync(path.dirname(newTarget), { recursive: true });
       fs.renameSync(oldTarget, newTarget);
-      store.recordActivity('rename_file', id, `Renamed ${old_path} to ${new_path}`, 'success');
-      res.json({ success: true });
-    } catch (err: any) {
-      res.status(400).json({ error: true, message: err.message });
+      store.recordActivity('rename_file', id, `Renamed ${oldPath} to ${newPath}`, 'success');
+      return res.json({ success: true });
+    } catch (err) {
+      next(err);
     }
   });
 
-  // Create directory
-  app.post('/api/servers/:id/files/mkdir', (req: Request, res: Response) => {
-    const id = req.params.id;
-    const { path: dirPath } = req.body;
-    if (!dirPath) return res.status(400).json({ error: true, message: 'path is required' });
-
+  app.post('/api/servers/:id/files/mkdir', (req: Request, res: Response, next: NextFunction) => {
     try {
+      const id = String(req.params.id);
+      assertValidServerId(id);
+      if (!store.getServer(id)) {
+        return res.status(404).json({ error: true, code: 'SERVER_NOT_FOUND', message: 'Server not found' });
+      }
+      const dirPath = typeof req.body?.path === 'string' ? req.body.path.trim() : '';
+      if (!dirPath) {
+        return res.status(400).json({ error: true, code: 'INVALID_PATH', message: 'path is required' });
+      }
+
       const target = safeResolveServerPath(id, dirPath);
       fs.mkdirSync(target, { recursive: true });
-      res.json({ success: true });
-    } catch (err: any) {
-      res.status(400).json({ error: true, message: err.message });
+      store.recordActivity('mkdir', id, `Created folder ${dirPath}`, 'success');
+      return res.json({ success: true });
+    } catch (err) {
+      next(err);
     }
   });
 
-  // Download file
-  app.get('/api/servers/:id/files/download', (req: Request, res: Response) => {
-    const id = req.params.id;
-    const filePath = req.query.path as string;
-    if (!filePath) return res.status(400).send('path required');
-
+  app.get('/api/servers/:id/files/download', (req: Request, res: Response, next: NextFunction) => {
     try {
+      const id = String(req.params.id);
+      assertValidServerId(id);
+      if (!store.getServer(id)) {
+        return res.status(404).json({ error: true, code: 'SERVER_NOT_FOUND', message: 'Server not found' });
+      }
+      const filePath = typeof req.query.path === 'string' ? req.query.path.trim() : '';
+      if (!filePath) {
+        return res.status(400).json({ error: true, code: 'INVALID_PATH', message: 'path query parameter is required' });
+      }
+
       const target = safeResolveServerPath(id, filePath);
       if (!fs.existsSync(target) || fs.statSync(target).isDirectory()) {
-        return res.status(404).send('File not found');
+        return res.status(404).json({ error: true, code: 'FILE_NOT_FOUND', message: 'File not found' });
       }
-      res.download(target, path.basename(target));
-    } catch (err: any) {
-      res.status(400).send(err.message);
+      return res.download(target, path.basename(target));
+    } catch (err) {
+      next(err);
     }
+  });
+
+  // Catch-all for unknown /api/* routes (always returns JSON, never HTML)
+  app.use('/api', (_req: Request, res: Response) => {
+    res.status(404).json({
+      error: true,
+      code: 'API_NOT_FOUND',
+      message: 'Requested API endpoint does not exist',
+    });
+  });
+
+  // Sanitized JSON error boundary for Express routes
+  app.use((err: unknown, _req: Request, res: Response, _next: NextFunction) => {
+    if (res.headersSent) return;
+    if (err instanceof HttpError) {
+      return res.status(err.statusCode).json({
+        error: true,
+        code: err.code,
+        message: err.message,
+      });
+    }
+    if (err && typeof err === 'object' && 'type' in err && (err as { type?: string }).type === 'entity.parse.failed') {
+      return res.status(400).json({
+        error: true,
+        code: 'INVALID_JSON',
+        message: 'Malformed JSON request body',
+      });
+    }
+    console.error('[PanelServer] Unhandled route error:', err);
+    return res.status(500).json({
+      error: true,
+      code: 'INTERNAL_ERROR',
+      message: 'An unexpected server error occurred',
+    });
   });
 
   // --- WebSocket Server ---
-  const wss = new WebSocketServer({ noServer: true });
+  const wss = new WebSocketServer({ noServer: true, maxPayload: 256 * 1024 });
 
   server.on('upgrade', (request, socket, head) => {
-    const pathname = request.url ? request.url.split('?')[0] : '';
-    if (pathname === '/ws' || pathname === '/api/ws') {
-      wss.handleUpgrade(request, socket, head, (ws) => {
-        wss.emit('connection', ws, request);
-      });
+    const rawUrl = request.url || '';
+    const pathname = rawUrl.split('?')[0];
+    if (pathname !== '/ws' && pathname !== '/api/ws') {
+      return; // Allow Vite HMR upgrade handler (when enabled) to inspect non-/ws paths
     }
+
+    const origin = request.headers.origin;
+    const effectiveHost = (request.headers['x-forwarded-host'] as string) || request.headers.host;
+    if (!isOriginAllowed(origin, effectiveHost)) {
+      socket.write('HTTP/1.1 403 Forbidden\r\nConnection: close\r\n\r\n');
+      socket.destroy();
+      return;
+    }
+
+    if (apiSecretKey) {
+      let queryToken = '';
+      try {
+        const parsedUrl = new URL(rawUrl, 'http://localhost');
+        queryToken = parsedUrl.searchParams.get('token') || '';
+      } catch {
+        // Ignore URL parse error
+      }
+      const authHeader = request.headers.authorization || '';
+      const bearerToken = authHeader.startsWith('Bearer ') ? authHeader.slice(7).trim() : '';
+      const token = bearerToken || queryToken;
+      if (token !== apiSecretKey) {
+        socket.write('HTTP/1.1 401 Unauthorized\r\nConnection: close\r\n\r\n');
+        socket.destroy();
+        return;
+      }
+    }
+
+    wss.handleUpgrade(request, socket, head, (ws) => {
+      wss.emit('connection', ws, request);
+    });
   });
 
   wss.on('connection', (ws) => {
-    wsSubscribers.set(ws, new Set());
+    const meta: WsClientMeta = {
+      subscriptions: new Set(),
+      isAlive: true,
+      seenRequestIds: [],
+    };
+    wsClients.set(ws, meta);
 
-    // Send connected handshake
-    ws.send(JSON.stringify({ event: 'connected', time: new Date().toISOString() }));
+    ws.on('pong', () => {
+      meta.isAlive = true;
+    });
+
+    ws.send(JSON.stringify({ event: 'connected', data: { time: new Date().toISOString() } }));
 
     ws.on('message', (data) => {
       try {
-        const payload = JSON.parse(data.toString());
+        const payload = JSON.parse(data.toString()) as {
+          action?: string;
+          serverId?: string;
+          command?: string;
+          data?: string;
+          requestId?: string;
+        };
 
-        // Subscription management
+        if (!payload || typeof payload.action !== 'string') return;
+
+        // Idempotency guard: prevent duplicate execution if a client retries a message with same requestId
+        if (payload.requestId && typeof payload.requestId === 'string') {
+          if (meta.seenRequestIds.includes(payload.requestId)) {
+            return;
+          }
+          meta.seenRequestIds.push(payload.requestId);
+          if (meta.seenRequestIds.length > 100) {
+            meta.seenRequestIds.shift();
+          }
+        }
+
+        if (payload.action === 'ping') {
+          ws.send(JSON.stringify({ event: 'pong', data: { time: new Date().toISOString() } }));
+          return;
+        }
+
         if (payload.action === 'subscribe' && payload.serverId) {
-          const subs = wsSubscribers.get(ws);
-          if (subs) subs.add(payload.serverId);
+          assertValidServerId(payload.serverId);
+          meta.subscriptions.add(payload.serverId);
 
-          // Deliver current terminal working directory
-          const root = path.resolve(SERVERS_DIR, payload.serverId);
-          const cwd = getServerWorkingDir(payload.serverId);
-          const rel = path.relative(root, cwd) || '.';
-          const activeTerm = activeTerminals.get(payload.serverId);
+          if (store.getServer(payload.serverId)) {
+            const root = fs.realpathSync(safeResolveServerPath(payload.serverId, ''));
+            const cwd = getServerWorkingDir(payload.serverId);
+            const rel = path.relative(root, cwd) || '.';
+            const activeTerm = activeTerminals.get(payload.serverId);
 
-          ws.send(
-            JSON.stringify({
-              event: 'terminal_state',
-              data: {
-                serverId: payload.serverId,
-                cwd: rel,
-                isRunning: Boolean(activeTerm),
-                currentCommand: activeTerm ? activeTerm.command : '',
-              },
-            })
-          );
+            ws.send(
+              JSON.stringify({
+                event: 'terminal_state',
+                data: {
+                  serverId: payload.serverId,
+                  cwd: rel,
+                  isRunning: Boolean(activeTerm),
+                  currentCommand: activeTerm ? activeTerm.command : '',
+                },
+              })
+            );
+          }
         } else if (payload.action === 'unsubscribe' && payload.serverId) {
-          const subs = wsSubscribers.get(ws);
-          if (subs) subs.delete(payload.serverId);
+          meta.subscriptions.delete(payload.serverId);
         } else if (payload.action === 'stdin' && payload.serverId) {
+          assertValidServerId(payload.serverId);
           const ap = activeProcesses.get(payload.serverId);
           if (ap && ap.process.stdin && !ap.process.stdin.destroyed) {
-            const text = String(payload.data || '') + '\n';
-            ap.process.stdin.write(text);
+            ap.process.stdin.write(String(payload.data ?? '') + '\n');
           }
-        }
-        // --- Interactive Terminal Actions ---
-        else if (payload.action === 'terminal_exec' && payload.serverId && payload.command) {
-          executeTerminalCommand(payload.serverId, payload.command);
+        } else if (payload.action === 'terminal_exec' && payload.serverId && payload.command) {
+          assertValidServerId(payload.serverId);
+          executeTerminalCommand(payload.serverId, String(payload.command));
         } else if (payload.action === 'terminal_kill' && payload.serverId) {
+          assertValidServerId(payload.serverId);
           killTerminalCommand(payload.serverId);
         } else if (payload.action === 'terminal_stdin' && payload.serverId) {
+          assertValidServerId(payload.serverId);
           const term = activeTerminals.get(payload.serverId);
           if (term && term.process.stdin && !term.process.stdin.destroyed) {
-            term.process.stdin.write(String(payload.data || '') + '\n');
+            term.process.stdin.write(String(payload.data ?? '') + '\n');
           }
         }
-      } catch {}
+      } catch {
+        // Safely ignore malformed or invalid WS payloads without disconnecting healthy sessions
+      }
     });
 
     ws.on('close', () => {
-      wsSubscribers.delete(ws);
+      wsClients.delete(ws);
     });
 
     ws.on('error', () => {
-      wsSubscribers.delete(ws);
+      wsClients.delete(ws);
     });
   });
 
-  // Vite middleware in dev or static files in production
-  if (!isProd) {
+  const wsHeartbeatTimer = setInterval(() => {
+    for (const [ws, meta] of wsClients.entries()) {
+      if (!meta.isAlive) {
+        wsClients.delete(ws);
+        try {
+          ws.terminate();
+        } catch {
+          // Ignore
+        }
+        continue;
+      }
+      meta.isAlive = false;
+      try {
+        ws.ping();
+      } catch {
+        // Ignore
+      }
+    }
+  }, 25_000);
+  wsHeartbeatTimer.unref?.();
+
+  let viteCloseFn: (() => Promise<void>) | null = null;
+
+  if (enableVite) {
     const { createServer: createViteServer } = await import('vite');
     const vite = await createViteServer({
-      server: { middlewareMode: true },
+      server: {
+        middlewareMode: true,
+        hmr: process.env.DISABLE_HMR === 'true' ? false : { server },
+        watch: {
+          ignored: [
+            '**/data/**',
+            '**/*.log',
+            '**/coverage/**',
+            '**/test-results/**',
+            '**/playwright-report/**',
+          ],
+        },
+      },
       appType: 'spa',
     });
+    viteCloseFn = () => vite.close();
     app.use(vite.middlewares);
-  } else {
-    app.use(express.static(path.join(__dirname, 'dist')));
-    app.get('*', (_req, res) => {
-      res.sendFile(path.join(__dirname, 'dist', 'index.html'));
-    });
+  } else if (serveStatic) {
+    const distDir = path.join(__dirname, 'dist');
+    if (fs.existsSync(distDir)) {
+      app.use(express.static(distDir));
+      app.get('*', (_req, res) => {
+        res.sendFile(path.join(distDir, 'index.html'));
+      });
+    }
   }
 
-  server.listen(PORT, '0.0.0.0', () => {
-    console.log(`[Termux NodePanel] Server listening at http://0.0.0.0:${PORT}`);
+  await new Promise<void>((resolve, reject) => {
+    const onError = (err: Error) => {
+      server.removeListener('listening', onListening);
+      reject(err);
+    };
+    const onListening = () => {
+      server.removeListener('error', onError);
+      const addr = server.address();
+      if (addr && typeof addr === 'object') {
+        boundPort = addr.port;
+      }
+      resolve();
+    };
+    server.once('error', onError);
+    server.once('listening', onListening);
+    server.listen(configuredPort, host);
   });
+
+  let closed = false;
+  const close = async (): Promise<void> => {
+    if (closed) return;
+    closed = true;
+    isShuttingDown = true;
+
+    clearInterval(wsHeartbeatTimer);
+
+    for (const id of supervisorStates.keys()) {
+      clearSupervisorTimers(id, true);
+    }
+
+    const stopPromises: Promise<void>[] = [];
+    for (const id of Array.from(activeProcesses.keys())) {
+      stopPromises.push(stopServerProcessInternal(id));
+    }
+    await Promise.allSettled(stopPromises);
+
+    for (const [, term] of activeTerminals.entries()) {
+      killProcessTree(term.process, 'SIGKILL');
+    }
+    activeTerminals.clear();
+
+    for (const [ws] of wsClients.entries()) {
+      try {
+        ws.close();
+      } catch {
+        // Ignore
+      }
+    }
+    wsClients.clear();
+
+    await new Promise<void>((resolve) => {
+      wss.close(() => resolve());
+    });
+
+    if (viteCloseFn) {
+      await viteCloseFn().catch(() => {});
+    }
+
+    await new Promise<void>((resolve) => {
+      server.close(() => resolve());
+    });
+  };
+
+  return {
+    app,
+    server,
+    wss,
+    port: boundPort,
+    dataDir,
+    close,
+    getActiveProcessCount: () => activeProcesses.size,
+    getActivePids: () => Array.from(activeProcesses.values()).map((ap) => ap.pid).filter((pid) => pid > 0),
+  };
 }
 
-// Cleanup active child processes on server shutdown
-function cleanupAll() {
-  for (const [, ap] of activeProcesses.entries()) {
-    try {
-      ap.process.kill('SIGTERM');
-    } catch {}
-  }
-  for (const [, term] of activeTerminals.entries()) {
-    try {
-      term.process.kill('SIGTERM');
-    } catch {}
-  }
-  process.exit(0);
-}
-process.on('SIGINT', cleanupAll);
-process.on('SIGTERM', cleanupAll);
+// Auto-start when executed directly via `tsx server.ts` or `node server.ts`
+const isDirectRun =
+  process.env.VITEST !== 'true' &&
+  Boolean(process.argv[1]) &&
+  path.resolve(process.argv[1]) === path.resolve(__filename);
 
-main().catch((err) => {
-  console.error('[Termux NodePanel] Failed to start server:', err);
-  process.exit(1);
-});
+if (isDirectRun) {
+  createPanelServer()
+    .then((instance) => {
+      console.log(`[Termux NodePanel] Server listening at http://0.0.0.0:${instance.port}`);
+
+      const shutdown = () => {
+        instance
+          .close()
+          .catch(() => {})
+          .finally(() => process.exit(0));
+      };
+      process.once('SIGINT', shutdown);
+      process.once('SIGTERM', shutdown);
+    })
+    .catch((err) => {
+      console.error('[Termux NodePanel] Failed to start server:', err);
+      process.exit(1);
+    });
+}

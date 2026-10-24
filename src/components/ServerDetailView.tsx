@@ -1,126 +1,170 @@
-import React, { useState, useEffect, useRef } from 'react';
+import React, { useCallback, useEffect, useRef, useState } from 'react';
 import {
-  ServerModel,
-  LogLine,
-  FileEntry,
-  AutoRestartPolicy,
-  EnvVariableInfo,
-  EnvInspectResult,
-  TerminalLine,
-} from '../types';
-import {
-  Play,
-  Square,
-  RotateCw,
-  Terminal,
-  FolderTree,
-  KeyRound,
-  GitBranch,
-  Settings,
-  Download,
-  Trash2,
-  Save,
-  Plus,
-  Send,
-  Eye,
-  EyeOff,
-  FileCode,
   ArrowLeft,
-  Loader2,
+  ChevronRight,
+  Copy,
+  Download,
+  Edit2,
+  FileCode,
   Folder,
   FolderPlus,
+  FolderTree,
+  GitBranch,
+  KeyRound,
   MoreVertical,
-  Copy,
-  Check,
-  Edit2,
-  AlertTriangle,
-  X,
-  ChevronRight,
+  Play,
+  Plus,
   RefreshCw,
+  RotateCw,
+  Save,
+  Send,
+  Settings,
   Sparkles,
+  Square,
+  Terminal,
+  Trash2,
 } from 'lucide-react';
 import {
-  fetchServer,
-  fetchServerLogs,
-  fetchServerFiles,
-  readServerFile,
-  writeServerFile,
-  deleteServerFile,
-  renameServerFile,
+  AutoRestartPolicy,
+  EnvInspectResult,
+  FileEntry,
+  LogLine,
+  PendingServerAction,
+  ServerModel,
+  ServerStatus,
+  TerminalLine,
+  ToastItem,
+} from '../types';
+import {
   createServerDirectory,
-  getServerFileDownloadUrl,
+  deleteServerFile,
+  fetchServer,
   fetchServerEnv,
-  saveServerEnv,
+  fetchServerFiles,
+  fetchServerLogs,
+  getServerFileDownloadUrl,
   initServerEnvExample,
-  updateServer,
   installServerDeps,
+  readServerFile,
+  renameServerFile,
+  saveServerEnv,
+  updateServer,
+  writeServerFile,
   wsClient,
 } from '../services/api';
+import {
+  Alert,
+  Badge,
+  Button,
+  Card,
+  CodeText,
+  ConfirmDialog,
+  DropdownMenu,
+  IconButton,
+  Input,
+  MetaRow,
+  Modal,
+  PageHeader,
+  PasswordInput,
+  Select,
+  Skeleton,
+  StatusPill,
+  Switch,
+  Tabs,
+  Textarea,
+} from './ui';
+import {
+  canRestartServer,
+  canStartServer,
+  canStopServer,
+  applyServerStatusUpdate,
+} from '../utils/serverLifecycle';
+import {
+  formatBytes,
+  formatCpuPercent,
+  formatMemoryMB,
+  formatTimestampTime,
+  formatUptime,
+} from '../utils/formatters';
+import {
+  validateEntryFile,
+  validateEnvKey,
+  validatePort,
+  validateRelativeEntryName,
+  validateServerName,
+} from '../utils/validation';
+import { isAbortError, normalizeError } from '../utils/errors';
 
-interface ServerDetailViewProps {
+export interface ServerDetailViewProps {
   serverId: string;
+  initialServer?: ServerModel | null;
+  pendingAction?: PendingServerAction;
   onBack: () => void;
   onStart: (id: string) => void;
   onStop: (id: string) => void;
   onRestart: (id: string) => void;
   onDelete: (id: string) => void;
+  onNotify?: (title: string, variant?: ToastItem['variant'], description?: string) => void;
 }
 
 type DetailTab = 'terminal' | 'files' | 'env' | 'logs' | 'settings' | 'git';
 
-interface ContextMenuState {
-  visible: boolean;
-  x: number;
-  y: number;
-  item: FileEntry | null;
-}
-
 export const ServerDetailView: React.FC<ServerDetailViewProps> = ({
   serverId,
+  initialServer = null,
+  pendingAction,
   onBack,
   onStart,
   onStop,
   onRestart,
   onDelete,
+  onNotify,
 }) => {
-  const [server, setServer] = useState<ServerModel | null>(null);
+  const [fetchedServer, setFetchedServer] = useState<ServerModel | null>(null);
   const [activeTab, setActiveTab] = useState<DetailTab>('terminal');
-  const [loading, setLoading] = useState(true);
-  const [error, setError] = useState<string | null>(null);
+  const [loading, setLoading] = useState(!initialServer);
+  const [syncWarning, setSyncWarning] = useState<string | null>(null);
 
-  // In-app alert / toast
-  const [toast, setToast] = useState<{ message: string; type: 'success' | 'error' | 'info' } | null>(null);
-  const showToast = (message: string, type: 'success' | 'error' | 'info' = 'success') => {
-    setToast({ message, type });
-    setTimeout(() => setToast(null), 3500);
-  };
+  const initialServerRef = useRef<ServerModel | null>(initialServer);
+  useEffect(() => {
+    initialServerRef.current = initialServer;
+  }, [initialServer]);
 
-  // --- TAB 1: Live Interactive Terminal State ---
+  const server: ServerModel | null =
+    fetchedServer && fetchedServer.id === serverId
+      ? initialServer && initialServer.id === serverId && initialServer.status === fetchedServer.status
+        ? { ...fetchedServer, metrics: initialServer.metrics ?? fetchedServer.metrics }
+        : fetchedServer
+      : initialServer && initialServer.id === serverId
+        ? initialServer
+        : null;
+
+  const notify = useCallback(
+    (title: string, variant: ToastItem['variant'] = 'success', description?: string) => {
+      onNotify?.(title, variant, description);
+    },
+    [onNotify]
+  );
+
+  // --- TAB 1: Live Interactive Terminal ---
   const [terminalLines, setTerminalLines] = useState<TerminalLine[]>([
     {
       id: 'init-1',
       timestamp: new Date().toISOString(),
       stream: 'system',
-      text: '[nodepanel-terminal] Interactive session initialized. Working directory isolated to server root.',
-    },
-    {
-      id: 'init-2',
-      timestamp: new Date().toISOString(),
-      stream: 'system',
-      text: '[nodepanel-terminal] Type commands below (e.g., npm install, node index.js, ls -la, pwd)',
+      text: '[nodepanel-terminal] Interactive session ready. Workspace sandboxed to server root.',
     },
   ]);
   const [terminalInput, setTerminalInput] = useState('');
   const [terminalHistory, setTerminalHistory] = useState<string[]>([]);
-  const [historyIndex, setHistoryIndex] = useState<number>(-1);
+  const [historyIndex, setHistoryIndex] = useState(-1);
   const [isTerminalRunning, setIsTerminalRunning] = useState(false);
   const [currentRunningCmd, setCurrentRunningCmd] = useState('');
-  const [terminalCwd, setTerminalCwd] = useState<string>('.');
+  const [terminalCwd, setTerminalCwd] = useState('.');
   const [terminalAutoScroll, setTerminalAutoScroll] = useState(true);
   const terminalBottomRef = useRef<HTMLDivElement>(null);
-  const terminalInputRef = useRef<HTMLInputElement>(null);
 
-  // --- TAB 2: File Manager State ---
+  // --- TAB 2: File Manager ---
   const [currentPath, setCurrentPath] = useState('');
   const [fileList, setFileList] = useState<FileEntry[]>([]);
   const [loadingFiles, setLoadingFiles] = useState(false);
@@ -129,18 +173,21 @@ export const ServerDetailView: React.FC<ServerDetailViewProps> = ({
   const [isSavingFile, setIsSavingFile] = useState(false);
   const [fileDirty, setFileDirty] = useState(false);
 
-  // Context Menu & File Actions Modal
-  const [contextMenu, setContextMenu] = useState<ContextMenuState>({ visible: false, x: 0, y: 0, item: null });
   const [renameTarget, setRenameTarget] = useState<FileEntry | null>(null);
   const [renameNewName, setRenameNewName] = useState('');
+  const [renameError, setRenameError] = useState<string | null>(null);
+
   const [deleteTarget, setDeleteTarget] = useState<FileEntry | null>(null);
+
   const [showNewFileModal, setShowNewFileModal] = useState(false);
   const [newFileName, setNewFileName] = useState('');
+  const [newFileError, setNewFileError] = useState<string | null>(null);
+
   const [showNewFolderModal, setShowNewFolderModal] = useState(false);
   const [newFolderName, setNewFolderName] = useState('');
-  const [copiedPathToast, setCopiedPathToast] = useState(false);
+  const [newFolderError, setNewFolderError] = useState<string | null>(null);
 
-  // --- TAB 3: Environment Variables Auto-Detection State ---
+  // --- TAB 3: Environment (.env & .env.example) ---
   const [envData, setEnvData] = useState<EnvInspectResult | null>(null);
   const [envValues, setEnvValues] = useState<Record<string, string>>({});
   const [envDescriptions, setEnvDescriptions] = useState<Record<string, string>>({});
@@ -148,162 +195,201 @@ export const ServerDetailView: React.FC<ServerDetailViewProps> = ({
   const [isSavingEnv, setIsSavingEnv] = useState(false);
   const [newEnvKey, setNewEnvKey] = useState('');
   const [newEnvVal, setNewEnvVal] = useState('');
+  const [newEnvError, setNewEnvError] = useState<string | null>(null);
   const [deleteEnvKey, setDeleteEnvKey] = useState<string | null>(null);
   const [loadingEnv, setLoadingEnv] = useState(false);
 
-  // --- TAB 4: Daemon Process Logs State ---
+  // --- TAB 4: Daemon Logs ---
   const [appLogs, setAppLogs] = useState<LogLine[]>([]);
   const [autoScrollLogs, setAutoScrollLogs] = useState(true);
   const logsBottomRef = useRef<HTMLDivElement>(null);
 
-  // --- TAB 5: Settings State ---
-  const [cfgName, setCfgName] = useState('');
-  const [cfgDesc, setCfgDesc] = useState('');
-  const [cfgPort, setCfgPort] = useState(3001);
-  const [cfgEntry, setCfgEntry] = useState('index.js');
-  const [cfgAutoRestart, setCfgAutoRestart] = useState<AutoRestartPolicy>('never');
+  // --- TAB 5: Lifecycle Settings ---
+  const [cfgName, setCfgName] = useState(initialServer?.name ?? '');
+  const [cfgDesc, setCfgDesc] = useState(initialServer?.description ?? '');
+  const [cfgPort, setCfgPort] = useState(String(initialServer?.port ?? 3001));
+  const [cfgEntry, setCfgEntry] = useState(initialServer?.entry_file ?? 'index.js');
+  const [cfgAutoRestart, setCfgAutoRestart] = useState<AutoRestartPolicy>(
+    initialServer?.auto_restart ?? 'never'
+  );
+  const [cfgErrors, setCfgErrors] = useState<Record<string, string>>({});
   const [isSavingCfg, setIsSavingCfg] = useState(false);
 
-  // Delete Server Confirmation Modal
   const [showDeleteServerModal, setShowDeleteServerModal] = useState(false);
-
-  // Quick npm install in header
   const [isInstallingDeps, setIsInstallingDeps] = useState(false);
 
-  // Deduplication & single-initial-seed refs to prevent "auto relog" loops
   const seenLogHashesRef = useRef<Set<string>>(new Set());
   const initialLogsSeededRef = useRef(false);
+  const configSeededForIdRef = useRef<string | null>(null);
 
-  // Load Main Server Data
-  const loadData = async () => {
-    try {
-      setLoading(true);
-      const srv = await fetchServer(serverId);
-      setServer(srv);
-      setCfgName(srv.name);
-      setCfgDesc(srv.description || '');
-      setCfgPort(srv.port);
-      setCfgEntry(srv.entry_file);
-      setCfgAutoRestart(srv.auto_restart);
+  const loadData = useCallback(
+    async (signal?: AbortSignal) => {
+      try {
+        const [srv, logs] = await Promise.all([
+          fetchServer(serverId, { signal }),
+          fetchServerLogs(serverId, { signal }),
+        ]);
 
-      const logs = await fetchServerLogs(serverId);
-      setAppLogs(logs || []);
+        setFetchedServer(srv);
+        setSyncWarning(null);
 
-      // Only seed initial logs into terminal lines ONCE on mount
-      if (!initialLogsSeededRef.current && logs && logs.length > 0) {
-        initialLogsSeededRef.current = true;
-        const newLines: TerminalLine[] = [];
-        for (let i = 0; i < logs.length; i++) {
-          const l = logs[i];
-          const hash = `${l.timestamp}_${l.text}`;
-          seenLogHashesRef.current.add(hash);
-          newLines.push({
-            id: `past-${i}-${hash}`,
-            timestamp: l.timestamp,
-            stream: l.stream as any,
-            text: l.text,
-          });
+        if (configSeededForIdRef.current !== srv.id) {
+          configSeededForIdRef.current = srv.id;
+          setCfgName(srv.name);
+          setCfgDesc(srv.description || '');
+          setCfgPort(String(srv.port));
+          setCfgEntry(srv.entry_file);
+          setCfgAutoRestart(srv.auto_restart);
         }
-        setTerminalLines((prev) => [...prev, ...newLines]);
+
+        setAppLogs(logs || []);
+
+        if (!initialLogsSeededRef.current && logs && logs.length > 0) {
+          initialLogsSeededRef.current = true;
+          const seeded: TerminalLine[] = [];
+          for (let i = 0; i < logs.length; i++) {
+            const l = logs[i];
+            const hash = `${l.timestamp}_${l.text}`;
+            seenLogHashesRef.current.add(hash);
+            seeded.push({
+              id: `seed-${i}-${hash}`,
+              timestamp: l.timestamp,
+              stream: l.stream,
+              text: l.text,
+            });
+          }
+          setTerminalLines((prev) => [...prev, ...seeded].slice(-1000));
+        }
+      } catch (err: unknown) {
+        if (isAbortError(err)) return;
+        const msg = normalizeError(err, 'Failed to synchronize instance details').message;
+        setSyncWarning(msg);
+      } finally {
+        setLoading(false);
       }
-    } catch (err: any) {
-      setError(err.message || 'Failed to load server');
-    } finally {
-      setLoading(false);
-    }
-  };
+    },
+    [serverId]
+  );
 
   useEffect(() => {
-    loadData();
+    seenLogHashesRef.current.clear();
+    initialLogsSeededRef.current = false;
+    configSeededForIdRef.current = null;
+
+    const controller = new AbortController();
+    const initTimer = globalThis.setTimeout(() => {
+      void loadData(controller.signal);
+    }, 0);
+
     wsClient.subscribeServer(serverId);
 
-    // Main App Logs from Server Daemon (strictly deduplicated)
-    const unsubLog = wsClient.on('log', (payload: any) => {
-      if (payload.server_id === serverId) {
-        const text = payload.text || '';
-        const timestamp = payload.timestamp || new Date().toISOString();
-        const hash = `${timestamp}_${text}`;
+    const unsubLog = wsClient.on<{
+      server_id: string;
+      timestamp?: string;
+      stream?: 'stdout' | 'stderr' | 'system';
+      text?: string;
+    }>('log', (payload) => {
+      if (payload?.server_id !== serverId) return;
+      const text = payload.text || '';
+      const timestamp = payload.timestamp || new Date().toISOString();
+      const hash = `${timestamp}_${text}`;
+      if (seenLogHashesRef.current.has(hash)) return;
+      seenLogHashesRef.current.add(hash);
 
-        if (seenLogHashesRef.current.has(hash)) {
-          return;
-        }
-        seenLogHashesRef.current.add(hash);
+      const newLine: LogLine = {
+        timestamp,
+        stream: payload.stream || 'stdout',
+        text,
+      };
+      setAppLogs((prev) => [...prev.slice(-999), newLine]);
+      setTerminalLines((prev) => [
+        ...prev.slice(-999),
+        {
+          id: `live-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`,
+          timestamp: newLine.timestamp,
+          stream: newLine.stream,
+          text: newLine.text,
+        },
+      ]);
+    });
 
-        const newLine: LogLine = {
-          timestamp,
+    const unsubStatus = wsClient.on<{
+      server_id: string;
+      new_status: ServerStatus;
+      exit_code: number;
+    }>('status', (payload) => {
+      if (payload?.server_id !== serverId) return;
+      setFetchedServer((prev) => {
+        const initSrv = initialServerRef.current;
+        const base =
+          prev && prev.id === serverId ? prev : initSrv && initSrv.id === serverId ? initSrv : null;
+        return base ? applyServerStatusUpdate(base, payload.new_status, payload.exit_code) : null;
+      });
+    });
+
+    const unsubTermStart = wsClient.on<{
+      serverId: string;
+      command?: string;
+      cwd?: string;
+    }>('terminal_start', (payload) => {
+      if (payload?.serverId !== serverId) return;
+      setIsTerminalRunning(true);
+      setCurrentRunningCmd(payload.command || '');
+      if (payload.cwd) setTerminalCwd(payload.cwd);
+    });
+
+    const unsubTermData = wsClient.on<{
+      serverId: string;
+      stream?: TerminalLine['stream'];
+      text?: string;
+    }>('terminal_data', (payload) => {
+      if (payload?.serverId !== serverId) return;
+      setTerminalLines((prev) => [
+        ...prev.slice(-999),
+        {
+          id: `term-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`,
+          timestamp: new Date().toISOString(),
           stream: payload.stream || 'stdout',
-          text,
-        };
-        setAppLogs((prev) => [...prev, newLine]);
-        setTerminalLines((prev) => [
-          ...prev,
-          {
-            id: `live-${Date.now()}-${Math.random().toString(36).substring(2, 6)}`,
-            timestamp: newLine.timestamp,
-            stream: newLine.stream,
-            text: newLine.text,
-          },
-        ]);
-      }
+          text: payload.text || '',
+        },
+      ]);
     });
 
-    // Server Lifecycle Status Change
-    const unsubStatus = wsClient.on('status', (payload: any) => {
-      if (payload.server_id === serverId) {
-        setServer((prev) =>
-          prev
-            ? { ...prev, status: payload.new_status, last_exit_code: payload.exit_code }
-            : null
-        );
-      }
+    const unsubTermExit = wsClient.on<{
+      serverId: string;
+      cwd?: string;
+    }>('terminal_exit', (payload) => {
+      if (payload?.serverId !== serverId) return;
+      setIsTerminalRunning(false);
+      setCurrentRunningCmd('');
+      if (payload.cwd) setTerminalCwd(payload.cwd);
     });
 
-    // Terminal Realtime Events
-    const unsubTermStart = wsClient.on('terminal_start', (payload: any) => {
-      if (payload.serverId === serverId) {
-        setIsTerminalRunning(true);
-        setCurrentRunningCmd(payload.command || '');
-        if (payload.cwd) setTerminalCwd(payload.cwd);
-      }
+    const unsubTermState = wsClient.on<{
+      serverId: string;
+      cwd?: string;
+      isRunning?: boolean;
+      currentCommand?: string;
+    }>('terminal_state', (payload) => {
+      if (payload?.serverId !== serverId) return;
+      if (payload.cwd) setTerminalCwd(payload.cwd);
+      setIsTerminalRunning(Boolean(payload.isRunning));
+      setCurrentRunningCmd(payload.currentCommand || '');
     });
 
-    const unsubTermData = wsClient.on('terminal_data', (payload: any) => {
-      if (payload.serverId === serverId) {
-        setTerminalLines((prev) => [
-          ...prev,
-          {
-            id: Date.now().toString() + Math.random().toString(36).substring(2, 5),
-            timestamp: new Date().toISOString(),
-            stream: payload.stream || 'stdout',
-            text: payload.text || '',
-          },
-        ]);
-      }
-    });
-
-    const unsubTermExit = wsClient.on('terminal_exit', (payload: any) => {
-      if (payload.serverId === serverId) {
-        setIsTerminalRunning(false);
-        setCurrentRunningCmd('');
-        if (payload.cwd) setTerminalCwd(payload.cwd);
-      }
-    });
-
-    const unsubTermState = wsClient.on('terminal_state', (payload: any) => {
-      if (payload.serverId === serverId) {
-        if (payload.cwd) setTerminalCwd(payload.cwd);
-        setIsTerminalRunning(Boolean(payload.isRunning));
-        setCurrentRunningCmd(payload.currentCommand || '');
-      }
-    });
-
-    const unsubTermClear = wsClient.on('terminal_clear', (payload: any) => {
-      if (payload.serverId === serverId) {
+    const unsubTermClear = wsClient.on<{ serverId: string }>('terminal_clear', (payload) => {
+      if (payload?.serverId === serverId) {
         setTerminalLines([]);
       }
     });
 
+    const unsubReconnect = wsClient.on('reconnected', () => {
+      void loadData();
+    });
+
     return () => {
+      globalThis.clearTimeout(initTimer);
+      controller.abort();
       wsClient.unsubscribeServer(serverId);
       unsubLog();
       unsubStatus();
@@ -312,68 +398,106 @@ export const ServerDetailView: React.FC<ServerDetailViewProps> = ({
       unsubTermExit();
       unsubTermState();
       unsubTermClear();
+      unsubReconnect();
     };
-  }, [serverId]);
+  }, [loadData, serverId]);
 
-  // Terminal Auto Scroll
   useEffect(() => {
     if (terminalAutoScroll && activeTab === 'terminal') {
-      terminalBottomRef.current?.scrollIntoView({ behavior: 'smooth' });
+      terminalBottomRef.current?.scrollIntoView?.({ behavior: 'auto' });
     }
   }, [terminalLines, terminalAutoScroll, activeTab]);
 
-  // Daemon Logs Auto Scroll
   useEffect(() => {
     if (autoScrollLogs && activeTab === 'logs') {
-      logsBottomRef.current?.scrollIntoView({ behavior: 'smooth' });
+      logsBottomRef.current?.scrollIntoView?.({ behavior: 'auto' });
     }
   }, [appLogs, autoScrollLogs, activeTab]);
 
-  // Load Files when Files Tab is Active
-  useEffect(() => {
-    if (activeTab === 'files') {
-      loadFiles(currentPath);
-    }
-  }, [activeTab, currentPath]);
-
-  // Load Environment Variables when Env Tab is Active
-  useEffect(() => {
-    if (activeTab === 'env') {
-      loadEnvironment();
-    }
-  }, [activeTab]);
-
-  // Close context menu on outside click or Escape
-  useEffect(() => {
-    const handleGlobalClick = () => {
-      if (contextMenu.visible) {
-        setContextMenu({ visible: false, x: 0, y: 0, item: null });
+  const loadFiles = useCallback(
+    async (subPath: string, signal?: AbortSignal) => {
+      try {
+        setLoadingFiles(true);
+        const files = await fetchServerFiles(serverId, subPath, { signal });
+        setFileList(files);
+      } catch (err: unknown) {
+        if (isAbortError(err)) return;
+        notify('Failed to read directory', 'error', normalizeError(err).message);
+      } finally {
+        setLoadingFiles(false);
       }
-    };
-    const handleKeyDown = (e: KeyboardEvent) => {
-      if (e.key === 'Escape') {
-        setContextMenu({ visible: false, x: 0, y: 0, item: null });
+    },
+    [notify, serverId]
+  );
+
+  const loadEnvironment = useCallback(
+    async (signal?: AbortSignal) => {
+      try {
+        setLoadingEnv(true);
+        const res = await fetchServerEnv(serverId, { signal });
+        setEnvData(res);
+
+        const valMap: Record<string, string> = {};
+        const descMap: Record<string, string> = {};
+        for (const v of res.variables) {
+          valMap[v.key] = v.value !== '' ? v.value : v.example_value || '';
+          if (v.comment) descMap[v.key] = v.comment;
+        }
+        setEnvValues(valMap);
+        setEnvDescriptions(descMap);
+      } catch (err: unknown) {
+        if (isAbortError(err)) return;
+        notify('Failed to load .env configuration', 'error', normalizeError(err).message);
+      } finally {
+        setLoadingEnv(false);
       }
-    };
-    window.addEventListener('click', handleGlobalClick);
-    window.addEventListener('keydown', handleKeyDown);
+    },
+    [notify, serverId]
+  );
+
+  useEffect(() => {
+    if (activeTab !== 'files') return;
+    const controller = new AbortController();
+    const timer = globalThis.setTimeout(() => {
+      void loadFiles(currentPath, controller.signal);
+    }, 0);
     return () => {
-      window.removeEventListener('click', handleGlobalClick);
-      window.removeEventListener('keydown', handleKeyDown);
+      globalThis.clearTimeout(timer);
+      controller.abort();
     };
-  }, [contextMenu.visible]);
+  }, [activeTab, currentPath, loadFiles]);
 
-  // --- TERMINAL COMMAND EXECUTION ---
+  useEffect(() => {
+    if (activeTab !== 'env') return;
+    const controller = new AbortController();
+    const timer = globalThis.setTimeout(() => {
+      void loadEnvironment(controller.signal);
+    }, 0);
+    return () => {
+      globalThis.clearTimeout(timer);
+      controller.abort();
+    };
+  }, [activeTab, loadEnvironment]);
+
+  // --- Terminal Actions ---
   const handleExecuteCommand = (commandOverride?: string) => {
-    const cmd = (commandOverride || terminalInput).trim();
+    const cmd = (commandOverride ?? terminalInput).trim();
     if (!cmd) return;
 
-    // Add to history
-    setTerminalHistory((prev) => [cmd, ...prev.filter((c) => c !== cmd)]);
+    setTerminalHistory((prev) => [cmd, ...prev.filter((c) => c !== cmd)].slice(0, 50));
     setHistoryIndex(-1);
     setTerminalInput('');
 
-    wsClient.sendTerminalExec(serverId, cmd);
+    const sent = wsClient.sendTerminalExec(serverId, cmd);
+    if (!sent) {
+      fetch(`/api/servers/${encodeURIComponent(serverId)}/terminal/exec`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ command: cmd }),
+      }).catch((err: unknown) => {
+        notify('Terminal command failed', 'error', normalizeError(err).message);
+      });
+    }
   };
 
   const handleTerminalKeyDown = (e: React.KeyboardEvent<HTMLInputElement>) => {
@@ -398,37 +522,30 @@ export const ServerDetailView: React.FC<ServerDetailViewProps> = ({
   };
 
   const handleKillTerminal = () => {
-    wsClient.sendTerminalKill(serverId);
-    showToast('Sent SIGINT (^C) to terminal command', 'info');
-  };
-
-  // --- FILE MANAGER OPERATIONS ---
-  const loadFiles = async (subPath: string) => {
-    try {
-      setLoadingFiles(true);
-      const files = await fetchServerFiles(serverId, subPath);
-      setFileList(files);
-    } catch (err: any) {
-      showToast('Failed to load files: ' + err.message, 'error');
-    } finally {
-      setLoadingFiles(false);
+    const sent = wsClient.sendTerminalKill(serverId);
+    if (!sent) {
+      fetch(`/api/servers/${encodeURIComponent(serverId)}/terminal/kill`, { method: 'POST' }).catch(
+        () => {}
+      );
     }
+    notify('Sent SIGINT (^C) to terminal process', 'info');
   };
 
+  // --- File Manager Actions ---
   const handleOpenFile = async (file: FileEntry) => {
     if (file.is_dir) {
       setCurrentPath(file.path);
       setSelectedFile(null);
       setFileDirty(false);
-    } else {
-      try {
-        const content = await readServerFile(serverId, file.path);
-        setSelectedFile(file.path);
-        setFileContent(content);
-        setFileDirty(false);
-      } catch (err: any) {
-        showToast('Failed to read file: ' + err.message, 'error');
-      }
+      return;
+    }
+    try {
+      const content = await readServerFile(serverId, file.path);
+      setSelectedFile(file.path);
+      setFileContent(content);
+      setFileDirty(false);
+    } catch (err: unknown) {
+      notify('Unable to open file', 'error', normalizeError(err).message);
     }
   };
 
@@ -438,48 +555,71 @@ export const ServerDetailView: React.FC<ServerDetailViewProps> = ({
       setIsSavingFile(true);
       await writeServerFile(serverId, selectedFile, fileContent);
       setFileDirty(false);
-      showToast(`Saved ${selectedFile.split('/').pop()}`, 'success');
-    } catch (err: any) {
-      showToast('Failed to save file: ' + err.message, 'error');
+      notify(`Saved ${selectedFile.split('/').pop()}`, 'success');
+      await loadFiles(currentPath);
+    } catch (err: unknown) {
+      notify('Failed to save file', 'error', normalizeError(err).message);
     } finally {
       setIsSavingFile(false);
     }
   };
 
-  const handleConfirmCreateFile = async () => {
-    if (!newFileName.trim()) return;
-    const target = currentPath ? `${currentPath}/${newFileName.trim()}` : newFileName.trim();
+  const handleConfirmCreateFile = async (e: React.FormEvent) => {
+    e.preventDefault();
+    const err = validateRelativeEntryName(newFileName, 'File name');
+    if (err) {
+      setNewFileError(err);
+      return;
+    }
+    const clean = newFileName.trim();
+    const target = currentPath ? `${currentPath}/${clean}` : clean;
     try {
       await writeServerFile(serverId, target, '');
       setShowNewFileModal(false);
       setNewFileName('');
+      setNewFileError(null);
       await loadFiles(currentPath);
       setSelectedFile(target);
       setFileContent('');
-      showToast(`Created file ${target.split('/').pop()}`, 'success');
-    } catch (err: any) {
-      showToast('Failed to create file: ' + err.message, 'error');
+      setFileDirty(false);
+      notify(`Created ${clean}`, 'success');
+    } catch (writeErr: unknown) {
+      setNewFileError(normalizeError(writeErr).message);
     }
   };
 
-  const handleConfirmCreateFolder = async () => {
-    if (!newFolderName.trim()) return;
-    const target = currentPath ? `${currentPath}/${newFolderName.trim()}` : newFolderName.trim();
+  const handleConfirmCreateFolder = async (e: React.FormEvent) => {
+    e.preventDefault();
+    const err = validateRelativeEntryName(newFolderName, 'Folder name');
+    if (err) {
+      setNewFolderError(err);
+      return;
+    }
+    const clean = newFolderName.trim();
+    const target = currentPath ? `${currentPath}/${clean}` : clean;
     try {
       await createServerDirectory(serverId, target);
       setShowNewFolderModal(false);
       setNewFolderName('');
+      setNewFolderError(null);
       await loadFiles(currentPath);
-      showToast(`Created folder ${target.split('/').pop()}`, 'success');
-    } catch (err: any) {
-      showToast('Failed to create folder: ' + err.message, 'error');
+      notify(`Created directory ${clean}`, 'success');
+    } catch (mkdirErr: unknown) {
+      setNewFolderError(normalizeError(mkdirErr).message);
     }
   };
 
-  const handleConfirmRename = async () => {
-    if (!renameTarget || !renameNewName.trim()) return;
+  const handleConfirmRename = async (e: React.FormEvent) => {
+    e.preventDefault();
+    if (!renameTarget) return;
+    const err = validateRelativeEntryName(renameNewName, 'New name');
+    if (err) {
+      setRenameError(err);
+      return;
+    }
+    const clean = renameNewName.trim();
     const parent = currentPath ? `${currentPath}/` : '';
-    const newPath = `${parent}${renameNewName.trim()}`;
+    const newPath = `${parent}${clean}`;
     try {
       await renameServerFile(serverId, renameTarget.path, newPath);
       if (selectedFile === renameTarget.path) {
@@ -487,80 +627,38 @@ export const ServerDetailView: React.FC<ServerDetailViewProps> = ({
       }
       setRenameTarget(null);
       setRenameNewName('');
+      setRenameError(null);
       await loadFiles(currentPath);
-      showToast(`Renamed to ${renameNewName.trim()}`, 'success');
-    } catch (err: any) {
-      showToast('Failed to rename: ' + err.message, 'error');
+      notify(`Renamed to ${clean}`, 'success');
+    } catch (renErr: unknown) {
+      setRenameError(normalizeError(renErr).message);
     }
   };
 
-  const handleConfirmDelete = async () => {
+  const handleConfirmDeleteFile = async () => {
     if (!deleteTarget) return;
     try {
       await deleteServerFile(serverId, deleteTarget.path);
       if (selectedFile === deleteTarget.path) {
         setSelectedFile(null);
         setFileContent('');
+        setFileDirty(false);
       }
+      const deletedName = deleteTarget.name;
       setDeleteTarget(null);
       await loadFiles(currentPath);
-      showToast(`Deleted ${deleteTarget.name}`, 'success');
-    } catch (err: any) {
-      showToast('Failed to delete: ' + err.message, 'error');
+      notify(`Deleted ${deletedName}`, 'info');
+    } catch (delErr: unknown) {
+      notify('Delete failed', 'error', normalizeError(delErr).message);
     }
-  };
-
-  const handleContextMenuTrigger = (e: React.MouseEvent, item: FileEntry) => {
-    e.preventDefault();
-    e.stopPropagation();
-
-    // Viewport bound calculation to guarantee pop-up never gets cut off
-    const menuWidth = 190;
-    const menuHeight = 220;
-    let x = e.clientX;
-    let y = e.clientY;
-
-    if (x + menuWidth > window.innerWidth - 16) {
-      x = window.innerWidth - menuWidth - 16;
-    }
-    if (y + menuHeight > window.innerHeight - 16) {
-      y = window.innerHeight - menuHeight - 16;
-    }
-
-    setContextMenu({ visible: true, x, y, item });
   };
 
   const handleCopyPath = (filePath: string) => {
-    navigator.clipboard.writeText(filePath);
-    setCopiedPathToast(true);
-    setTimeout(() => setCopiedPathToast(false), 2000);
-    showToast(`Copied path: ${filePath}`, 'info');
+    navigator.clipboard?.writeText(filePath).catch(() => {});
+    notify('Copied relative path', 'info', filePath);
   };
 
-  // --- ENVIRONMENT VARIABLES AUTO-DETECTION ---
-  const loadEnvironment = async () => {
-    try {
-      setLoadingEnv(true);
-      const res = await fetchServerEnv(serverId);
-      setEnvData(res);
-
-      const valMap: Record<string, string> = {};
-      const descMap: Record<string, string> = {};
-
-      for (const v of res.variables) {
-        // Pre-fill with existing value, or default to example_value from template so user doesn't have to type it manually!
-        valMap[v.key] = v.value !== '' ? v.value : (v.example_value || '');
-        if (v.comment) descMap[v.key] = v.comment;
-      }
-      setEnvValues(valMap);
-      setEnvDescriptions(descMap);
-    } catch (err: any) {
-      showToast('Failed to load environment: ' + err.message, 'error');
-    } finally {
-      setLoadingEnv(false);
-    }
-  };
-
+  // --- Environment Actions ---
   const handleApplyAllTemplates = () => {
     if (!envData) return;
     const updated = { ...envValues };
@@ -572,7 +670,7 @@ export const ServerDetailView: React.FC<ServerDetailViewProps> = ({
       }
     }
     setEnvValues(updated);
-    showToast(`Berhasil mengisi ${count} nilai dari template .env.example`, 'success');
+    notify(`Populated ${count} template values from .env.example`, 'info');
   };
 
   const handleApplyAndSaveTemplate = async () => {
@@ -587,10 +685,10 @@ export const ServerDetailView: React.FC<ServerDetailViewProps> = ({
     try {
       setIsSavingEnv(true);
       const res = await saveServerEnv(serverId, updated);
-      showToast(`Berhasil menerapkan & menyimpan ${res.count} nilai template ke .env!`, 'success');
+      notify(`Saved ${res.count} environment variables to .env`, 'success');
       await loadEnvironment();
-    } catch (err: any) {
-      showToast('Gagal menyimpan ke .env: ' + err.message, 'error');
+    } catch (err: unknown) {
+      notify('Failed to save .env', 'error', normalizeError(err).message);
     } finally {
       setIsSavingEnv(false);
     }
@@ -600,10 +698,10 @@ export const ServerDetailView: React.FC<ServerDetailViewProps> = ({
     try {
       setIsSavingEnv(true);
       const res = await saveServerEnv(serverId, envValues);
-      showToast(`Berhasil menyimpan ${res.count} environment variables ke .env`, 'success');
+      notify(`Saved ${res.count} variables to .env`, 'success');
       await loadEnvironment();
-    } catch (err: any) {
-      showToast('Failed to save .env: ' + err.message, 'error');
+    } catch (err: unknown) {
+      notify('Failed to save .env', 'error', normalizeError(err).message);
     } finally {
       setIsSavingEnv(false);
     }
@@ -612,49 +710,67 @@ export const ServerDetailView: React.FC<ServerDetailViewProps> = ({
   const handleInitEnvExample = async () => {
     try {
       await initServerEnvExample(serverId);
-      showToast('Initialized .env.example template', 'success');
+      notify('Created .env.example template', 'success');
       await loadEnvironment();
-    } catch (err: any) {
-      showToast('Failed: ' + err.message, 'error');
+    } catch (err: unknown) {
+      notify('Failed to create .env.example', 'error', normalizeError(err).message);
     }
   };
 
-  const handleAddEnvVariable = () => {
-    const k = newEnvKey.trim().toUpperCase();
-    if (!k) return;
-    setEnvValues((prev) => ({ ...prev, [k]: newEnvVal }));
+  const handleAddEnvVariable = (e: React.FormEvent) => {
+    e.preventDefault();
+    const key = newEnvKey.trim().toUpperCase();
+    const err = validateEnvKey(key);
+    if (err) {
+      setNewEnvError(err);
+      return;
+    }
+    setNewEnvError(null);
+    setEnvValues((prev) => ({ ...prev, [key]: newEnvVal }));
     setNewEnvKey('');
     setNewEnvVal('');
-    showToast(`Added ${k} (remember to save to .env)`, 'info');
+    notify(`Added ${key}`, 'info', 'Click Save to .env to persist changes.');
   };
 
   const handleConfirmDeleteEnv = () => {
     if (!deleteEnvKey) return;
+    const removed = deleteEnvKey;
     setEnvValues((prev) => {
-      const copy = { ...prev };
-      delete copy[deleteEnvKey];
-      return copy;
+      const next = { ...prev };
+      delete next[removed];
+      return next;
     });
-    showToast(`Removed ${deleteEnvKey} (remember to save to .env)`, 'info');
     setDeleteEnvKey(null);
+    notify(`Removed ${removed}`, 'info', 'Click Save to .env to persist changes.');
   };
 
-  // --- SETTINGS / CONFIGURATION ---
+  // --- Settings & Dependencies ---
   const handleSaveConfig = async (e: React.FormEvent) => {
     e.preventDefault();
+    const errs: Record<string, string> = {};
+    const nameErr = validateServerName(cfgName);
+    if (nameErr) errs.name = nameErr;
+    const portErr = validatePort(cfgPort);
+    if (portErr) errs.port = portErr;
+    const entryErr = validateEntryFile(cfgEntry);
+    if (entryErr) errs.entry = entryErr;
+
+    setCfgErrors(errs);
+    if (Object.keys(errs).length > 0) return;
+
     try {
       setIsSavingCfg(true);
       const updated = await updateServer(serverId, {
-        name: cfgName,
-        description: cfgDesc,
-        port: cfgPort,
-        entry_file: cfgEntry,
+        name: cfgName.trim(),
+        description: cfgDesc.trim(),
+        port: Number(cfgPort),
+        entry_file: cfgEntry.trim(),
         auto_restart: cfgAutoRestart,
       });
-      setServer(updated);
-      showToast('Server configuration updated', 'success');
-    } catch (err: any) {
-      showToast('Failed to update config: ' + err.message, 'error');
+      setFetchedServer((prev) => (prev ? { ...prev, ...updated } : updated));
+      notify('Configuration saved', 'success');
+    } catch (err: unknown) {
+      notify('Failed to save configuration', 'error', normalizeError(err).message);
     } finally {
       setIsSavingCfg(false);
     }
@@ -663,21 +779,21 @@ export const ServerDetailView: React.FC<ServerDetailViewProps> = ({
   const handleRunNpmInstall = async () => {
     try {
       setIsInstallingDeps(true);
-      showToast('Running npm install on host...', 'info');
+      notify('Running npm install...', 'info');
       const res = await installServerDeps(serverId);
-      showToast('npm install completed successfully', 'success');
-      // Append output to terminal lines
+      notify('npm install completed', 'success');
       setTerminalLines((prev) => [
-        ...prev,
+        ...prev.slice(-999),
         {
-          id: Date.now().toString(),
+          id: `npm-${Date.now()}`,
           timestamp: new Date().toISOString(),
           stream: 'system',
           text: `[nodepanel-deps] npm install completed:\n${res.output}`,
         },
       ]);
-    } catch (err: any) {
-      showToast('npm install failed: ' + err.message, 'error');
+      await loadData();
+    } catch (err: unknown) {
+      notify('npm install failed', 'error', normalizeError(err).message);
     } finally {
       setIsInstallingDeps(false);
     }
@@ -685,1020 +801,760 @@ export const ServerDetailView: React.FC<ServerDetailViewProps> = ({
 
   if (loading && !server) {
     return (
-      <div className="glass-panel p-12 rounded-2xl text-center text-slate-400">
-        <Loader2 className="w-8 h-8 animate-spin mx-auto mb-2 text-emerald-400" />
-        <p className="text-xs">Loading instance details...</p>
+      <div className="space-y-6">
+        <Skeleton className="h-20 w-full rounded-xl" />
+        <Skeleton className="h-10 w-96 rounded-lg" />
+        <Skeleton className="h-[460px] w-full rounded-xl" />
       </div>
     );
   }
 
-  if (error || !server) {
+  if (!server) {
     return (
-      <div className="glass-panel p-6 rounded-2xl space-y-4">
-        <div className="text-rose-400 font-semibold text-sm">Failed to load server: {error}</div>
-        <button
-          onClick={onBack}
-          className="px-3.5 py-2 bg-white/10 hover:bg-white/15 text-slate-200 text-xs font-semibold rounded-xl"
-        >
-          Back to Server List
-        </button>
-      </div>
+      <Card padding="lg" className="space-y-4">
+        <Alert variant="error" title="Instance unavailable">
+          {syncWarning || `Server '${serverId}' could not be found.`}
+        </Alert>
+        <div>
+          <Button variant="secondary" size="sm" onClick={onBack} leftIcon={<ArrowLeft className="w-3.5 h-3.5" />}>
+            Back to Servers
+          </Button>
+        </div>
+      </Card>
     );
   }
 
-  const isRunning = server.status === 'running';
+  const effectiveStatus =
+    pendingAction === 'starting' || pendingAction === 'restarting'
+      ? 'starting'
+      : pendingAction === 'stopping'
+      ? 'stopping'
+      : server.status;
+
+  const isRunning = server.status === 'running' && !pendingAction;
+  const allowStart = canStartServer(server.status, pendingAction);
+  const allowStop = canStopServer(server.status, pendingAction);
+  const allowRestart = canRestartServer(server.status, pendingAction);
 
   return (
     <div className="space-y-6">
-      {/* Toast Notification */}
-      {toast && (
-        <div className="fixed bottom-5 right-5 z-50 animate-in fade-in slide-in-from-bottom-2 duration-150">
-          <div
-            className={`px-4 py-2.5 rounded-xl shadow-2xl text-xs font-semibold border backdrop-blur-xl flex items-center gap-2 ${
-              toast.type === 'error'
-                ? 'bg-rose-950/90 text-rose-200 border-rose-500/40'
-                : toast.type === 'info'
-                ? 'bg-cyan-950/90 text-cyan-200 border-cyan-500/40'
-                : 'bg-emerald-950/90 text-emerald-200 border-emerald-500/40'
-            }`}
-          >
-            <span>{toast.message}</span>
-          </div>
-        </div>
+      {syncWarning && (
+        <Alert
+          variant="warning"
+          title="Instance telemetry temporarily stale"
+          action={
+            <Button variant="secondary" size="sm" onClick={() => void loadData()}>
+              Retry
+            </Button>
+          }
+        >
+          {syncWarning}
+        </Alert>
       )}
 
-      {/* Bento Header Glass Card */}
-      <div className="glass-panel glass-specular rounded-2xl p-6 flex flex-col md:flex-row md:items-center justify-between gap-4">
-        <div className="flex items-center gap-3">
-          <button
+      <PageHeader
+        title={server.name}
+        backAction={
+          <IconButton
+            aria-label="Back to servers"
+            variant="outline"
+            size="sm"
             onClick={onBack}
-            className="p-2 text-slate-400 hover:text-white bg-white/[0.04] border border-white/[0.08] rounded-xl hover:bg-white/[0.08] transition-colors"
-            title="Back to Servers"
-          >
-            <ArrowLeft className="w-4 h-4" />
-          </button>
+            icon={<ArrowLeft className="w-4 h-4" />}
+          />
+        }
+        meta={
+          <MetaRow
+            items={[
+              <StatusPill key="status" status={effectiveStatus} />,
+              <span key="port" className="font-mono text-[#E2E8F0]">
+                Port :{server.port}
+              </span>,
+              <span key="entry" className="font-mono text-[#A2AAB8]">
+                Entry: {server.entry_file}
+              </span>,
+              <span key="id" className="font-mono text-[#697386]">
+                {server.id}
+              </span>,
+              isRunning
+                ? `RAM ${formatMemoryMB(server.metrics?.memory_mb)}`
+                : `Last exit ${server.last_exit_code ?? 0}`,
+              isRunning && server.metrics?.cpu_percent !== null && server.metrics?.cpu_percent !== undefined
+                ? `CPU ${formatCpuPercent(server.metrics.cpu_percent)}`
+                : null,
+              isRunning && server.metrics?.pid
+                ? `PID ${server.metrics.pid} · ${formatUptime(server.metrics.uptime_sec)}`
+                : null,
+            ]}
+          />
+        }
+        actions={
+          <>
+            {server.status === 'running' || server.status === 'starting' || server.status === 'stopping' ? (
+              <>
+                <Button
+                  variant="danger"
+                  size="sm"
+                  disabled={!allowStop}
+                  loading={pendingAction === 'stopping'}
+                  onClick={() => onStop(server.id)}
+                  leftIcon={<Square className="w-3.5 h-3.5" />}
+                >
+                  Stop
+                </Button>
+                <Button
+                  variant="secondary"
+                  size="sm"
+                  disabled={!allowRestart}
+                  loading={pendingAction === 'restarting'}
+                  onClick={() => onRestart(server.id)}
+                  leftIcon={<RotateCw className="w-3.5 h-3.5" />}
+                >
+                  Restart
+                </Button>
+              </>
+            ) : (
+              <Button
+                variant="primary"
+                size="sm"
+                disabled={!allowStart}
+                loading={pendingAction === 'starting'}
+                onClick={() => onStart(server.id)}
+                leftIcon={<Play className="w-3.5 h-3.5 fill-current" />}
+              >
+                Start Server
+              </Button>
+            )}
 
-          <div>
-            <div className="flex items-center gap-2.5 flex-wrap">
-              <h2 className="text-xl font-bold text-white tracking-tight">{server.name}</h2>
-              <span className="text-xs font-mono text-slate-400">
-                <span>Port</span> <strong className="text-emerald-300">:{server.port}</strong>
-              </span>
-              <span className="text-xs text-slate-500 font-mono">·</span>
-              <span className="text-xs font-mono text-slate-300 capitalize flex items-center gap-1.5">
-                <span
-                  className={`w-2 h-2 rounded-full ${
-                    isRunning
-                      ? 'bg-emerald-400 shadow-[0_0_8px_rgba(16,185,129,0.8)]'
-                      : server.status === 'crashed'
-                      ? 'bg-rose-400'
-                      : 'bg-slate-500'
-                  }`}
-                />
-                <span>{server.status}</span>
-              </span>
+            <Button
+              variant="outline"
+              size="sm"
+              loading={isInstallingDeps}
+              disabled={Boolean(pendingAction)}
+              onClick={() => void handleRunNpmInstall()}
+              leftIcon={<Download className="w-3.5 h-3.5 text-emerald-400" />}
+            >
+              npm install
+            </Button>
+
+            <IconButton
+              aria-label="Delete server instance"
+              variant="ghost"
+              size="sm"
+              disabled={Boolean(pendingAction)}
+              onClick={() => setShowDeleteServerModal(true)}
+              icon={<Trash2 className="w-4 h-4 text-[#8A94A6] hover:text-red-400" />}
+            />
+          </>
+        }
+      />
+
+      {/* Detail Section Tabs */}
+      <Tabs<DetailTab>
+        ariaLabel="Server workspace sections"
+        value={activeTab}
+        onChange={setActiveTab}
+        items={[
+          {
+            id: 'terminal',
+            label: 'Live Terminal',
+            icon: <Terminal className="w-3.5 h-3.5" />,
+          },
+          {
+            id: 'files',
+            label: 'File Manager',
+            icon: <FolderTree className="w-3.5 h-3.5" />,
+          },
+          {
+            id: 'env',
+            label: 'Environment (.env)',
+            icon: <KeyRound className="w-3.5 h-3.5" />,
+          },
+          {
+            id: 'logs',
+            label: 'App Logs',
+            icon: <FileCode className="w-3.5 h-3.5" />,
+            count: appLogs.length > 0 ? appLogs.length : undefined,
+          },
+          {
+            id: 'settings',
+            label: 'Settings',
+            icon: <Settings className="w-3.5 h-3.5" />,
+          },
+          {
+            id: 'git',
+            label: 'Git Sync',
+            icon: <GitBranch className="w-3.5 h-3.5" />,
+          },
+        ]}
+      />
+
+      {/* TAB 1: LIVE INTERACTIVE TERMINAL */}
+      {activeTab === 'terminal' && (
+        <Card padding="none" className="overflow-hidden flex flex-col h-[540px]">
+          <div className="px-4 py-2.5 bg-[#0B0D10] border-b border-[#1F242D] flex items-center justify-between flex-wrap gap-2">
+            <div className="flex items-center gap-2 font-mono text-xs text-[#A2AAB8] min-w-0">
+              <Terminal className="w-3.5 h-3.5 text-emerald-400 shrink-0" aria-hidden="true" />
+              <span className="text-[#697386]">cwd:</span>
+              <CodeText className="truncate max-w-[280px] sm:max-w-md">
+                data/servers/{server.id}/{terminalCwd === '.' ? '' : terminalCwd}
+              </CodeText>
             </div>
 
-            <div className="text-xs text-slate-400 flex items-center gap-3 mt-1.5 font-mono flex-wrap">
-              <span className="text-slate-400">{server.id}</span>
-              <span>·</span>
-              <span>
-                Entry: <code className="text-slate-200">{server.entry_file}</code>
-              </span>
-              {server.metrics && isRunning && (
-                <>
-                  <span>·</span>
-                  <span>
-                    RAM: <strong className="text-emerald-400">{server.metrics.memory_mb.toFixed(1)} MB</strong>
-                  </span>
-                  <span>·</span>
-                  <span>
-                    PID: <strong className="text-cyan-400">{server.metrics.pid}</strong>
-                  </span>
-                </>
+            <div className="flex items-center gap-3 flex-wrap">
+              {isTerminalRunning && (
+                <div className="inline-flex items-center gap-2">
+                  <Badge tone="warning" mono>
+                    Running: {currentRunningCmd}
+                  </Badge>
+                  <Button variant="danger" size="sm" onClick={handleKillTerminal}>
+                    Stop (^C)
+                  </Button>
+                </div>
               )}
+
+              <Switch
+                checked={terminalAutoScroll}
+                onChange={setTerminalAutoScroll}
+                label="Auto-scroll"
+              />
+
+              <Button variant="ghost" size="sm" onClick={() => setTerminalLines([])}>
+                Clear
+              </Button>
             </div>
           </div>
-        </div>
 
-        {/* Action Controls */}
-        <div className="flex items-center gap-2 flex-wrap">
-          {isRunning ? (
-            <>
-              <button
-                onClick={() => {
-                  onStop(server.id);
-                  setTerminalLines((prev) => [
-                    ...prev,
-                    {
-                      id: Date.now().toString(),
-                      timestamp: new Date().toISOString(),
-                      stream: 'system',
-                      text: `[nodepanel] Stop signal sent for '${server.name}'...`,
-                    },
-                  ]);
-                }}
-                className="flex items-center gap-1.5 bg-rose-500/15 hover:bg-rose-500/25 text-rose-300 border border-rose-500/30 px-3.5 py-1.5 rounded-xl text-xs font-semibold transition-colors"
-              >
-                <Square className="w-3.5 h-3.5" />
-                <span>Stop</span>
-              </button>
-              <button
-                onClick={() => {
-                  onRestart(server.id);
-                  setTerminalLines((prev) => [
-                    ...prev,
-                    {
-                      id: Date.now().toString(),
-                      timestamp: new Date().toISOString(),
-                      stream: 'system',
-                      text: `[nodepanel] Triggering restart sequence for '${server.name}'...`,
-                    },
-                  ]);
-                }}
-                className="flex items-center gap-1.5 bg-amber-500/15 hover:bg-amber-500/25 text-amber-300 border border-amber-500/30 px-3 py-1.5 rounded-xl text-xs font-semibold transition-colors"
-              >
-                <RotateCw className="w-3.5 h-3.5" />
-                <span>Restart</span>
-              </button>
-            </>
-          ) : (
-            <button
-              onClick={() => {
-                onStart(server.id);
-                setTerminalLines((prev) => [
-                  ...prev,
-                  {
-                    id: Date.now().toString(),
-                    timestamp: new Date().toISOString(),
-                    stream: 'system',
-                    text: `[nodepanel] Starting server '${server.name}' (Port: ${server.port})...`,
-                  },
-                ]);
-              }}
-              className="flex items-center gap-1.5 bg-gradient-to-r from-emerald-500 to-teal-500 hover:from-emerald-400 hover:to-teal-400 text-slate-950 px-4 py-1.5 rounded-xl text-xs font-bold shadow-[0_0_15px_rgba(16,185,129,0.3)] transition-colors"
-            >
-              <Play className="w-3.5 h-3.5 fill-current" />
-              <span>Start Server</span>
-            </button>
-          )}
-
-          <button
-            onClick={handleRunNpmInstall}
-            disabled={isInstallingDeps}
-            className="flex items-center gap-1.5 bg-white/[0.04] hover:bg-white/[0.08] text-slate-200 border border-white/[0.08] px-3 py-1.5 rounded-xl text-xs font-medium transition-colors disabled:opacity-50"
-            title="Execute npm install in server directory"
+          <div
+            data-testid="terminal-output"
+            className="flex-1 p-4 overflow-y-auto font-mono text-xs bg-[#060709] space-y-1 select-text"
           >
-            <Download className="w-3.5 h-3.5 text-cyan-400" />
-            <span>{isInstallingDeps ? 'Installing...' : 'npm install'}</span>
-          </button>
-
-          <button
-            onClick={() => setShowDeleteServerModal(true)}
-            className="p-2 text-slate-500 hover:text-rose-400 hover:bg-rose-500/10 rounded-xl transition-colors"
-            title="Delete Server"
-          >
-            <Trash2 className="w-4 h-4" />
-          </button>
-        </div>
-      </div>
-
-      {/* Segmented Tab Navigation Bar */}
-      <div className="glass-panel p-1 rounded-2xl flex items-center gap-1 overflow-x-auto">
-        {[
-          { id: 'terminal' as DetailTab, label: 'Live Terminal', icon: Terminal, badge: isTerminalRunning ? 'Running' : undefined },
-          { id: 'files' as DetailTab, label: 'File Manager', icon: FolderTree },
-          { id: 'env' as DetailTab, label: 'Environment (.env)', icon: KeyRound, badge: envData?.has_example ? 'Auto-Sync' : undefined },
-          { id: 'logs' as DetailTab, label: 'App Logs', icon: FileCode },
-          { id: 'settings' as DetailTab, label: 'Settings', icon: Settings },
-          { id: 'git' as DetailTab, label: 'Git Sync', icon: GitBranch },
-        ].map((tab) => {
-          const Icon = tab.icon;
-          const isActive = activeTab === tab.id;
-
-          return (
-            <button
-              key={tab.id}
-              onClick={() => setActiveTab(tab.id)}
-              className={`flex items-center gap-2 px-3.5 py-2 rounded-xl text-xs font-medium transition-all whitespace-nowrap ${
-                isActive
-                  ? 'bg-white/10 text-emerald-300 font-semibold shadow-sm'
-                  : 'text-slate-400 hover:text-slate-200'
-              }`}
-            >
-              <Icon className="w-3.5 h-3.5" />
-              <span>{tab.label}</span>
-              {tab.badge && (
-                <span className="text-[10px] px-1.5 py-0.5 rounded-full bg-emerald-500/20 text-emerald-300 border border-emerald-500/30">
-                  {tab.badge}
-                </span>
-              )}
-            </button>
-          );
-        })}
-      </div>
-
-      {/* ========================================================================= */}
-      {/* TAB 1: LIVE INTERACTIVE TERMINAL                                          */}
-      {/* ========================================================================= */}
-      {activeTab === 'terminal' && (
-        <div className="space-y-3">
-          <div className="glass-panel rounded-2xl overflow-hidden flex flex-col h-[540px]">
-            {/* Terminal Header Toolbar */}
-            <div className="bg-black/40 px-4 py-2.5 border-b border-white/[0.08] flex items-center justify-between flex-wrap gap-2">
-              <div className="flex items-center gap-2">
-                <span className="w-2.5 h-2.5 rounded-full bg-rose-500/80 inline-block" />
-                <span className="w-2.5 h-2.5 rounded-full bg-amber-500/80 inline-block" />
-                <span className="w-2.5 h-2.5 rounded-full bg-emerald-500/80 inline-block" />
-                <span className="font-mono text-xs text-slate-300 ml-2 flex items-center gap-1.5">
-                  <Terminal className="w-3.5 h-3.5 text-emerald-400" />
-                  <span className="text-slate-400">cwd:</span>
-                  <span className="text-emerald-400 font-semibold bg-emerald-500/10 px-2 py-0.5 rounded-md border border-emerald-500/20">
-                    data/servers/{server.id}/{terminalCwd === '.' ? '' : terminalCwd}
-                  </span>
-                </span>
-              </div>
-
-              <div className="flex items-center gap-2">
-                {isTerminalRunning && (
-                  <div className="flex items-center gap-1.5 bg-amber-500/15 border border-amber-500/30 px-2 py-0.5 rounded-lg text-[11px] text-amber-300">
-                    <Loader2 className="w-3 h-3 animate-spin" />
-                    <span>Running: {currentRunningCmd}</span>
-                    <button
-                      onClick={handleKillTerminal}
-                      className="ml-1 px-1.5 py-0.5 bg-rose-500/30 hover:bg-rose-500/50 text-rose-200 rounded font-bold"
-                      title="Send SIGINT (Ctrl+C)"
-                    >
-                      Stop (^C)
-                    </button>
-                  </div>
-                )}
-
-                <button
-                  onClick={() => setTerminalAutoScroll(!terminalAutoScroll)}
-                  className={`text-[11px] px-2.5 py-1 rounded-lg border transition-colors ${
-                    terminalAutoScroll
-                      ? 'bg-emerald-500/15 text-emerald-300 border-emerald-500/30'
-                      : 'bg-white/[0.04] text-slate-400 border-white/[0.06]'
-                  }`}
-                >
-                  Auto-scroll: {terminalAutoScroll ? 'ON' : 'OFF'}
-                </button>
-
-                <button
-                  onClick={() => setTerminalLines([])}
-                  className="text-[11px] px-2.5 py-1 rounded-lg bg-white/[0.04] hover:bg-white/[0.08] text-slate-300 border border-white/[0.06]"
-                >
-                  Clear
-                </button>
-              </div>
-            </div>
-
-            {/* Terminal Body */}
-            <div className="flex-1 p-4 overflow-y-auto font-mono text-xs text-slate-200 space-y-1 bg-black/60 select-text">
-              {terminalLines.map((line) => {
-                let colorClass = 'text-slate-300';
-                let prefix = '';
-                if (line.stream === 'stderr') {
-                  colorClass = 'text-rose-400';
-                } else if (line.stream === 'command') {
-                  colorClass = 'text-cyan-300 font-bold';
-                } else if (line.stream === 'system') {
-                  colorClass = 'text-emerald-400/90 italic';
-                }
+            {terminalLines.length === 0 ? (
+              <div className="text-[#5B6475] py-6 text-center">Terminal buffer cleared.</div>
+            ) : (
+              terminalLines.map((line) => {
+                const textColor =
+                  line.stream === 'stderr'
+                    ? 'text-red-400'
+                    : line.stream === 'command'
+                    ? 'text-[#F3F5F8] font-semibold'
+                    : line.stream === 'system'
+                    ? 'text-emerald-400'
+                    : 'text-[#D0D7E2]';
 
                 return (
-                  <div key={line.id} className="flex items-start gap-2 leading-relaxed break-all">
-                    <span className="text-slate-600 text-[10px] select-none shrink-0">
-                      {new Date(line.timestamp).toLocaleTimeString([], { hour12: false })}
+                  <div key={line.id} className="flex items-start gap-2.5 leading-relaxed break-all">
+                    <span className="text-[#5B6475] text-[11px] tabular-nums select-none shrink-0">
+                      {formatTimestampTime(line.timestamp)}
                     </span>
-                    <span className={colorClass}>
-                      {prefix}
-                      {line.text}
-                    </span>
+                    <span className={textColor}>{line.text}</span>
                   </div>
                 );
-              })}
-              <div ref={terminalBottomRef} />
-            </div>
-
-            {/* Quick Command Suggestions */}
-            <div className="bg-black/40 px-3 py-1.5 border-t border-white/[0.06] flex items-center gap-1.5 overflow-x-auto text-[11px] font-mono text-slate-400">
-              <span className="text-slate-500 text-[10px] shrink-0">Quick run:</span>
-              {[
-                'npm install',
-                'node index.js',
-                'ls -la',
-                'cat package.json',
-                'npm test',
-                'pwd',
-              ].map((cmd) => (
-                <button
-                  key={cmd}
-                  onClick={() => handleExecuteCommand(cmd)}
-                  className="px-2 py-0.5 rounded-md bg-white/[0.04] hover:bg-white/[0.1] text-slate-300 border border-white/[0.08] whitespace-nowrap transition-colors"
-                >
-                  {cmd}
-                </button>
-              ))}
-            </div>
-
-            {/* Terminal Command Input Bar */}
-            <form
-              onSubmit={(e) => {
-                e.preventDefault();
-                handleExecuteCommand();
-              }}
-              className="p-3 bg-black/50 border-t border-white/[0.08] flex items-center gap-2"
-            >
-              <span className="text-emerald-400 font-mono text-xs pl-2 font-bold">$</span>
-              <input
-                ref={terminalInputRef}
-                type="text"
-                placeholder="Type command (e.g. npm install, node index.js, ls -la) or 'clear'..."
-                value={terminalInput}
-                onChange={(e) => setTerminalInput(e.target.value)}
-                onKeyDown={handleTerminalKeyDown}
-                className="flex-1 bg-transparent border-none text-xs text-slate-100 placeholder-slate-600 focus:outline-none font-mono"
-              />
-              <button
-                type="submit"
-                disabled={!terminalInput.trim()}
-                className="px-3 py-1 bg-emerald-500 hover:bg-emerald-400 text-slate-950 font-bold text-xs rounded-lg disabled:opacity-30 transition-colors flex items-center gap-1"
-                title="Execute Command"
-              >
-                <span>Run</span>
-                <Send className="w-3 h-3" />
-              </button>
-            </form>
+              })
+            )}
+            <div ref={terminalBottomRef} />
           </div>
-        </div>
+
+          <div className="px-4 py-2 bg-[#0B0D10] border-t border-[#181C24] flex items-center gap-1.5 overflow-x-auto text-xs font-mono">
+            <span className="text-[#697386] text-[11px] font-sans shrink-0 mr-1">Quick run:</span>
+            {['pwd', 'ls -la', 'cat package.json', 'npm install', 'node index.js'].map((cmd) => (
+              <button
+                key={cmd}
+                type="button"
+                onClick={() => handleExecuteCommand(cmd)}
+                className="px-2 py-0.5 rounded bg-[#14171D] hover:bg-[#1B1F27] text-[#D0D7E2] border border-[#242A35] whitespace-nowrap transition-colors"
+              >
+                {cmd}
+              </button>
+            ))}
+          </div>
+
+          <form
+            onSubmit={(e) => {
+              e.preventDefault();
+              handleExecuteCommand();
+            }}
+            className="p-2.5 bg-[#0E1014] border-t border-[#1F242D] flex items-center gap-2"
+          >
+            <span className="text-emerald-400 font-mono text-xs pl-2 font-semibold select-none">
+              $
+            </span>
+            <input
+              type="text"
+              aria-label="Terminal command input"
+              placeholder="Enter shell command (e.g. ls -la, pwd, npm test) or 'clear'..."
+              value={terminalInput}
+              onChange={(e) => setTerminalInput(e.target.value)}
+              onKeyDown={handleTerminalKeyDown}
+              className="flex-1 h-8 bg-transparent text-xs text-[#F3F5F8] placeholder-[#5B6475] font-mono focus:outline-none"
+            />
+            <Button
+              type="submit"
+              variant="primary"
+              size="sm"
+              disabled={!terminalInput.trim()}
+              rightIcon={<Send className="w-3 h-3" />}
+            >
+              Run
+            </Button>
+          </form>
+        </Card>
       )}
 
-      {/* ========================================================================= */}
-      {/* TAB 2: FILE MANAGER WITH FLOATING CONTEXT MENU                            */}
-      {/* ========================================================================= */}
+      {/* TAB 2: FILE MANAGER */}
       {activeTab === 'files' && (
-        <div className="grid grid-cols-1 md:grid-cols-3 gap-5 h-[580px]">
-          {/* File Explorer Tree Panel */}
-          <div className="glass-panel rounded-2xl p-4 flex flex-col justify-between overflow-hidden">
-            <div>
-              {/* Explorer Header & Breadcrumb */}
-              <div className="flex items-center justify-between mb-3 pb-2 border-b border-white/[0.08]">
-                <div className="text-xs font-semibold text-slate-200 flex items-center gap-1.5 truncate">
-                  <FolderTree className="w-3.5 h-3.5 text-emerald-400 shrink-0" />
-                  <span
-                    onClick={() => setCurrentPath('')}
-                    className="hover:text-emerald-300 cursor-pointer"
-                  >
-                    root
-                  </span>
-                  {currentPath && (
-                    <>
-                      <ChevronRight className="w-3 h-3 text-slate-500 shrink-0" />
-                      <span className="truncate text-slate-300">{currentPath}</span>
-                    </>
-                  )}
-                </div>
-
-                <div className="flex items-center gap-1">
-                  {currentPath && (
-                    <button
-                      onClick={() => {
-                        const parts = currentPath.split('/');
-                        parts.pop();
-                        setCurrentPath(parts.join('/'));
-                      }}
-                      className="p-1 text-slate-400 hover:text-slate-200 text-xs rounded-lg hover:bg-white/[0.06]"
-                      title="Parent Directory"
-                    >
-                      ..
-                    </button>
-                  )}
-                  <button
-                    onClick={() => setShowNewFileModal(true)}
-                    className="p-1.5 text-slate-400 hover:text-emerald-400 hover:bg-white/[0.06] rounded-lg transition-colors"
-                    title="New File"
-                  >
-                    <Plus className="w-3.5 h-3.5" />
-                  </button>
-                  <button
-                    onClick={() => setShowNewFolderModal(true)}
-                    className="p-1.5 text-slate-400 hover:text-amber-400 hover:bg-white/[0.06] rounded-lg transition-colors"
-                    title="New Folder"
-                  >
-                    <FolderPlus className="w-3.5 h-3.5" />
-                  </button>
-                  <button
-                    onClick={() => loadFiles(currentPath)}
-                    className="p-1.5 text-slate-400 hover:text-slate-200 hover:bg-white/[0.06] rounded-lg transition-colors"
-                    title="Refresh"
-                  >
-                    <RefreshCw className={`w-3.5 h-3.5 ${loadingFiles ? 'animate-spin' : ''}`} />
-                  </button>
-                </div>
-              </div>
-
-              {/* Files & Folders List */}
-              <div className="overflow-y-auto max-h-[460px] space-y-1 pr-1">
-                {fileList.length === 0 ? (
-                  <div className="py-8 text-center text-xs text-slate-500 italic">
-                    {loadingFiles ? 'Scanning files...' : 'Folder is empty'}
-                  </div>
-                ) : (
-                  fileList.map((f) => (
-                    <div
-                      key={f.path}
-                      onContextMenu={(e) => handleContextMenuTrigger(e, f)}
-                      onClick={() => handleOpenFile(f)}
-                      className={`group flex items-center justify-between px-3 py-2 rounded-xl text-xs cursor-pointer transition-colors relative ${
-                        selectedFile === f.path
-                          ? 'bg-emerald-500/15 text-emerald-300 font-semibold border border-emerald-500/30'
-                          : 'text-slate-300 hover:bg-white/[0.05]'
-                      }`}
-                    >
-                      <div className="flex items-center gap-2 truncate flex-1">
-                        {f.is_dir ? (
-                          <Folder className="w-3.5 h-3.5 text-amber-400 shrink-0" />
-                        ) : (
-                          <FileCode className="w-3.5 h-3.5 text-cyan-400 shrink-0" />
-                        )}
-                        <span className="truncate">{f.name}</span>
-                      </div>
-
-                      {/* 3-Dots Action Button for Context Menu Pop-up */}
-                      <button
-                        onClick={(e) => handleContextMenuTrigger(e, f)}
-                        className="p-1 text-slate-500 hover:text-slate-200 hover:bg-white/[0.08] rounded-lg opacity-80 group-hover:opacity-100 transition-opacity"
-                        title="Actions"
-                      >
-                        <MoreVertical className="w-3.5 h-3.5" />
-                      </button>
-                    </div>
-                  ))
+        <div className="grid grid-cols-1 lg:grid-cols-3 gap-5 lg:h-[560px]">
+          <Card padding="none" className="flex flex-col overflow-hidden h-[360px] lg:h-full">
+            <div className="px-3.5 py-2.5 bg-[#0B0D10] border-b border-[#1F242D] flex items-center justify-between gap-2">
+              <div className="flex items-center gap-1 text-xs font-mono text-[#D0D7E2] min-w-0">
+                <FolderTree className="w-3.5 h-3.5 text-emerald-400 shrink-0 mr-1" aria-hidden="true" />
+                <button
+                  type="button"
+                  onClick={() => setCurrentPath('')}
+                  className="hover:text-emerald-400 font-semibold shrink-0"
+                >
+                  root
+                </button>
+                {currentPath && (
+                  <>
+                    <ChevronRight className="w-3 h-3 text-[#5B6475] shrink-0" aria-hidden="true" />
+                    <span className="truncate text-[#A2AAB8]">{currentPath}</span>
+                  </>
                 )}
               </div>
-            </div>
-          </div>
 
-          {/* Code Editor Panel */}
-          <div className="md:col-span-2 glass-panel rounded-2xl flex flex-col overflow-hidden">
-            <div className="bg-black/40 px-4 py-2.5 border-b border-white/[0.08] flex items-center justify-between">
-              <div className="flex items-center gap-2 truncate font-mono text-xs text-slate-300">
-                <FileCode className="w-3.5 h-3.5 text-cyan-400 shrink-0" />
-                <span className="truncate">{selectedFile ? selectedFile : 'No file open'}</span>
-                {fileDirty && <span className="text-amber-400 text-[10px] font-bold">● Unsaved</span>}
+              <div className="flex items-center gap-1 shrink-0">
+                {currentPath && (
+                  <Button
+                    variant="ghost"
+                    size="sm"
+                    onClick={() => {
+                      const parts = currentPath.split('/');
+                      parts.pop();
+                      setCurrentPath(parts.join('/'));
+                    }}
+                    className="h-7 px-2 font-mono"
+                  >
+                    ..
+                  </Button>
+                )}
+                <IconButton
+                  aria-label="New file"
+                  size="sm"
+                  variant="ghost"
+                  onClick={() => {
+                    setNewFileName('');
+                    setNewFileError(null);
+                    setShowNewFileModal(true);
+                  }}
+                  className="h-7 w-7"
+                  icon={<Plus className="w-3.5 h-3.5" />}
+                />
+                <IconButton
+                  aria-label="New folder"
+                  size="sm"
+                  variant="ghost"
+                  onClick={() => {
+                    setNewFolderName('');
+                    setNewFolderError(null);
+                    setShowNewFolderModal(true);
+                  }}
+                  className="h-7 w-7"
+                  icon={<FolderPlus className="w-3.5 h-3.5" />}
+                />
+                <IconButton
+                  aria-label="Refresh files"
+                  size="sm"
+                  variant="ghost"
+                  loading={loadingFiles}
+                  onClick={() => void loadFiles(currentPath)}
+                  className="h-7 w-7"
+                  icon={<RefreshCw className="w-3.5 h-3.5" />}
+                />
+              </div>
+            </div>
+
+            <div className="flex-1 overflow-y-auto p-2 space-y-0.5">
+              {loadingFiles && fileList.length === 0 ? (
+                <div className="p-2 space-y-2">
+                  <Skeleton className="h-8 w-full" />
+                  <Skeleton className="h-8 w-full" />
+                  <Skeleton className="h-8 w-full" />
+                </div>
+              ) : fileList.length === 0 ? (
+                <div className="py-10 text-center text-xs text-[#697386]">Directory is empty.</div>
+              ) : (
+                fileList.map((entry) => {
+                  const isSelected = selectedFile === entry.path;
+
+                  return (
+                    <div
+                      key={entry.path}
+                      className={`group flex items-center justify-between gap-2 px-2.5 py-1.5 rounded-lg text-xs transition-colors ${
+                        isSelected
+                          ? 'bg-[#161A22] text-[#F3F5F8] border border-[#2B313D]'
+                          : 'text-[#D0D7E2] hover:bg-[#12151B] border border-transparent'
+                      }`}
+                    >
+                      <button
+                        type="button"
+                        onClick={() => void handleOpenFile(entry)}
+                        className="flex items-center gap-2 min-w-0 flex-1 text-left py-0.5"
+                      >
+                        {entry.is_dir ? (
+                          <Folder className="w-3.5 h-3.5 text-amber-400 shrink-0" aria-hidden="true" />
+                        ) : (
+                          <FileCode className="w-3.5 h-3.5 text-emerald-400 shrink-0" aria-hidden="true" />
+                        )}
+                        <span className="truncate font-mono">{entry.name}</span>
+                      </button>
+
+                      <div className="flex items-center gap-1.5 shrink-0">
+                        {!entry.is_dir && (
+                          <span className="text-[10px] font-mono text-[#697386] tabular-nums">
+                            {formatBytes(entry.size)}
+                          </span>
+                        )}
+
+                        <DropdownMenu
+                          header={entry.name}
+                          trigger={
+                            <IconButton
+                              aria-label={`Actions for ${entry.name}`}
+                              size="sm"
+                              variant="ghost"
+                              className="h-6 w-6"
+                              icon={<MoreVertical className="w-3.5 h-3.5" />}
+                            />
+                          }
+                          items={[
+                            {
+                              id: 'open',
+                              label: entry.is_dir ? 'Open Folder' : 'Open in Editor',
+                              icon: entry.is_dir ? (
+                                <Folder className="w-3.5 h-3.5 text-amber-400" />
+                              ) : (
+                                <FileCode className="w-3.5 h-3.5 text-emerald-400" />
+                              ),
+                              onSelect: () => void handleOpenFile(entry),
+                            },
+                            {
+                              id: 'rename',
+                              label: 'Rename',
+                              icon: <Edit2 className="w-3.5 h-3.5" />,
+                              onSelect: () => {
+                                setRenameTarget(entry);
+                                setRenameNewName(entry.name);
+                                setRenameError(null);
+                              },
+                            },
+                            ...(!entry.is_dir
+                              ? [
+                                  {
+                                    id: 'download',
+                                    label: 'Download',
+                                    icon: <Download className="w-3.5 h-3.5" />,
+                                    href: getServerFileDownloadUrl(serverId, entry.path),
+                                    download: entry.name,
+                                  },
+                                ]
+                              : []),
+                            {
+                              id: 'copy-path',
+                              label: 'Copy Path',
+                              icon: <Copy className="w-3.5 h-3.5" />,
+                              onSelect: () => handleCopyPath(entry.path),
+                            },
+                            {
+                              id: 'delete',
+                              label: 'Delete',
+                              icon: <Trash2 className="w-3.5 h-3.5" />,
+                              danger: true,
+                              onSelect: () => setDeleteTarget(entry),
+                            },
+                          ]}
+                        />
+                      </div>
+                    </div>
+                  );
+                })
+              )}
+            </div>
+          </Card>
+
+          <Card padding="none" className="lg:col-span-2 flex flex-col overflow-hidden h-[420px] lg:h-full">
+            <div className="px-4 py-2.5 bg-[#0B0D10] border-b border-[#1F242D] flex items-center justify-between gap-2">
+              <div className="flex items-center gap-2 min-w-0 font-mono text-xs text-[#D0D7E2]">
+                <FileCode className="w-3.5 h-3.5 text-emerald-400 shrink-0" aria-hidden="true" />
+                <span className="truncate">{selectedFile || 'Select a file to inspect or edit'}</span>
+                {fileDirty && <Badge tone="warning">Unsaved</Badge>}
               </div>
 
               {selectedFile && (
-                <div className="flex items-center gap-2">
-                  <button
-                    onClick={handleSaveFile}
-                    disabled={isSavingFile}
-                    className="flex items-center gap-1.5 px-3 py-1 bg-emerald-500 hover:bg-emerald-400 text-slate-950 font-bold text-xs rounded-xl shadow-sm transition-colors disabled:opacity-50"
-                  >
-                    <Save className="w-3.5 h-3.5" />
-                    <span>{isSavingFile ? 'Saving...' : 'Save File'}</span>
-                  </button>
-                </div>
+                <Button
+                  variant="primary"
+                  size="sm"
+                  loading={isSavingFile}
+                  onClick={() => void handleSaveFile()}
+                  leftIcon={<Save className="w-3.5 h-3.5" />}
+                >
+                  Save File
+                </Button>
               )}
             </div>
 
-            <div className="flex-1 p-2 bg-black/60 relative">
+            <div className="flex-1 bg-[#060709] flex flex-col">
               {selectedFile ? (
                 <textarea
+                  aria-label={`Editor for ${selectedFile}`}
                   value={fileContent}
                   onChange={(e) => {
                     setFileContent(e.target.value);
                     setFileDirty(true);
                   }}
-                  className="w-full h-full bg-transparent text-slate-100 font-mono text-xs p-3 focus:outline-none resize-none leading-relaxed select-text"
                   spellCheck={false}
+                  className="w-full flex-1 bg-transparent text-[#F3F5F8] font-mono text-xs p-4 focus:outline-none resize-none leading-relaxed"
                 />
               ) : (
-                <div className="h-full flex flex-col items-center justify-center text-slate-500 text-xs gap-2">
-                  <FolderTree className="w-8 h-8 text-slate-600" />
-                  <span>Select any file on the left to view or edit</span>
+                <div className="flex-1 flex flex-col items-center justify-center text-xs text-[#697386] gap-2 p-6 text-center">
+                  <FolderTree className="w-7 h-7 text-[#323A48]" aria-hidden="true" />
+                  <span>Choose a file from the workspace explorer to edit its contents.</span>
                 </div>
               )}
             </div>
-          </div>
+          </Card>
         </div>
       )}
 
-      {/* Floating Pop-up Context Menu (Requirement 6) */}
-      {contextMenu.visible && contextMenu.item && (
-        <div
-          style={{ top: `${contextMenu.y}px`, left: `${contextMenu.x}px` }}
-          className="fixed z-50 w-44 glass-panel bg-slate-900/95 border border-white/[0.12] rounded-xl shadow-2xl p-1 text-xs animate-in fade-in zoom-in-95 duration-100 backdrop-blur-xl"
-          onClick={(e) => e.stopPropagation()}
-        >
-          <div className="px-2.5 py-1 text-[10px] font-semibold text-slate-400 border-b border-white/[0.08] truncate mb-1">
-            {contextMenu.item.name}
-          </div>
-
-          <button
-            onClick={() => {
-              handleOpenFile(contextMenu.item!);
-              setContextMenu({ visible: false, x: 0, y: 0, item: null });
-            }}
-            className="w-full text-left px-2.5 py-1.5 rounded-lg text-slate-200 hover:bg-white/[0.08] flex items-center gap-2 transition-colors"
-          >
-            {contextMenu.item.is_dir ? <Folder className="w-3.5 h-3.5 text-amber-400" /> : <FileCode className="w-3.5 h-3.5 text-cyan-400" />}
-            <span>{contextMenu.item.is_dir ? 'Open Folder' : 'Open / Edit'}</span>
-          </button>
-
-          <button
-            onClick={() => {
-              setRenameTarget(contextMenu.item);
-              setRenameNewName(contextMenu.item!.name);
-              setContextMenu({ visible: false, x: 0, y: 0, item: null });
-            }}
-            className="w-full text-left px-2.5 py-1.5 rounded-lg text-slate-200 hover:bg-white/[0.08] flex items-center gap-2 transition-colors"
-          >
-            <Edit2 className="w-3.5 h-3.5 text-emerald-400" />
-            <span>Rename</span>
-          </button>
-
-          {!contextMenu.item.is_dir && (
-            <a
-              href={getServerFileDownloadUrl(serverId, contextMenu.item.path)}
-              download={contextMenu.item.name}
-              onClick={() => setContextMenu({ visible: false, x: 0, y: 0, item: null })}
-              className="w-full text-left px-2.5 py-1.5 rounded-lg text-slate-200 hover:bg-white/[0.08] flex items-center gap-2 transition-colors"
-            >
-              <Download className="w-3.5 h-3.5 text-cyan-400" />
-              <span>Download</span>
-            </a>
-          )}
-
-          <button
-            onClick={() => {
-              handleCopyPath(contextMenu.item!.path);
-              setContextMenu({ visible: false, x: 0, y: 0, item: null });
-            }}
-            className="w-full text-left px-2.5 py-1.5 rounded-lg text-slate-200 hover:bg-white/[0.08] flex items-center gap-2 transition-colors"
-          >
-            <Copy className="w-3.5 h-3.5 text-amber-400" />
-            <span>Copy Path</span>
-          </button>
-
-          <div className="my-1 border-t border-white/[0.06]" />
-
-          <button
-            onClick={() => {
-              setDeleteTarget(contextMenu.item);
-              setContextMenu({ visible: false, x: 0, y: 0, item: null });
-            }}
-            className="w-full text-left px-2.5 py-1.5 rounded-lg text-rose-300 hover:bg-rose-500/20 flex items-center gap-2 transition-colors"
-          >
-            <Trash2 className="w-3.5 h-3.5 text-rose-400" />
-            <span>Delete</span>
-          </button>
-        </div>
-      )}
-
-      {/* Modal: New File */}
-      {showNewFileModal && (
-        <div className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-black/60 backdrop-blur-sm animate-in fade-in">
-          <div className="glass-panel w-full max-w-sm rounded-2xl p-5 space-y-4 border border-white/[0.12]">
-            <div className="flex items-center justify-between">
-              <h3 className="text-sm font-bold text-white flex items-center gap-2">
-                <FileCode className="w-4 h-4 text-cyan-400" />
-                <span>Create New File</span>
-              </h3>
-              <button onClick={() => setShowNewFileModal(false)} className="text-slate-400 hover:text-white">
-                <X className="w-4 h-4" />
-              </button>
-            </div>
-            <div>
-              <label className="text-xs text-slate-300 block mb-1">File Name</label>
-              <input
-                type="text"
-                placeholder="config.json or index.js"
-                value={newFileName}
-                onChange={(e) => setNewFileName(e.target.value)}
-                autoFocus
-                className="w-full bg-black/40 border border-white/[0.1] rounded-xl px-3 py-2 text-xs text-slate-100 font-mono focus:outline-none"
-              />
-            </div>
-            <div className="flex justify-end gap-2 pt-2">
-              <button
-                onClick={() => setShowNewFileModal(false)}
-                className="px-3 py-1.5 rounded-xl text-xs text-slate-400 hover:bg-white/[0.06]"
-              >
-                Cancel
-              </button>
-              <button
-                onClick={handleConfirmCreateFile}
-                disabled={!newFileName.trim()}
-                className="px-4 py-1.5 bg-emerald-500 hover:bg-emerald-400 text-slate-950 font-bold text-xs rounded-xl disabled:opacity-40"
-              >
-                Create
-              </button>
-            </div>
-          </div>
-        </div>
-      )}
-
-      {/* Modal: New Folder */}
-      {showNewFolderModal && (
-        <div className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-black/60 backdrop-blur-sm animate-in fade-in">
-          <div className="glass-panel w-full max-w-sm rounded-2xl p-5 space-y-4 border border-white/[0.12]">
-            <div className="flex items-center justify-between">
-              <h3 className="text-sm font-bold text-white flex items-center gap-2">
-                <FolderPlus className="w-4 h-4 text-amber-400" />
-                <span>Create New Folder</span>
-              </h3>
-              <button onClick={() => setShowNewFolderModal(false)} className="text-slate-400 hover:text-white">
-                <X className="w-4 h-4" />
-              </button>
-            </div>
-            <div>
-              <label className="text-xs text-slate-300 block mb-1">Folder Name</label>
-              <input
-                type="text"
-                placeholder="src or lib"
-                value={newFolderName}
-                onChange={(e) => setNewFolderName(e.target.value)}
-                autoFocus
-                className="w-full bg-black/40 border border-white/[0.1] rounded-xl px-3 py-2 text-xs text-slate-100 font-mono focus:outline-none"
-              />
-            </div>
-            <div className="flex justify-end gap-2 pt-2">
-              <button
-                onClick={() => setShowNewFolderModal(false)}
-                className="px-3 py-1.5 rounded-xl text-xs text-slate-400 hover:bg-white/[0.06]"
-              >
-                Cancel
-              </button>
-              <button
-                onClick={handleConfirmCreateFolder}
-                disabled={!newFolderName.trim()}
-                className="px-4 py-1.5 bg-amber-500 hover:bg-amber-400 text-slate-950 font-bold text-xs rounded-xl disabled:opacity-40"
-              >
-                Create
-              </button>
-            </div>
-          </div>
-        </div>
-      )}
-
-      {/* Modal: Rename */}
-      {renameTarget && (
-        <div className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-black/60 backdrop-blur-sm animate-in fade-in">
-          <div className="glass-panel w-full max-w-sm rounded-2xl p-5 space-y-4 border border-white/[0.12]">
-            <div className="flex items-center justify-between">
-              <h3 className="text-sm font-bold text-white flex items-center gap-2">
-                <Edit2 className="w-4 h-4 text-emerald-400" />
-                <span>Rename {renameTarget.is_dir ? 'Folder' : 'File'}</span>
-              </h3>
-              <button onClick={() => setRenameTarget(null)} className="text-slate-400 hover:text-white">
-                <X className="w-4 h-4" />
-              </button>
-            </div>
-            <div>
-              <label className="text-xs text-slate-300 block mb-1">New Name</label>
-              <input
-                type="text"
-                value={renameNewName}
-                onChange={(e) => setRenameNewName(e.target.value)}
-                autoFocus
-                className="w-full bg-black/40 border border-white/[0.1] rounded-xl px-3 py-2 text-xs text-slate-100 font-mono focus:outline-none"
-              />
-            </div>
-            <div className="flex justify-end gap-2 pt-2">
-              <button
-                onClick={() => setRenameTarget(null)}
-                className="px-3 py-1.5 rounded-xl text-xs text-slate-400 hover:bg-white/[0.06]"
-              >
-                Cancel
-              </button>
-              <button
-                onClick={handleConfirmRename}
-                disabled={!renameNewName.trim() || renameNewName.trim() === renameTarget.name}
-                className="px-4 py-1.5 bg-emerald-500 hover:bg-emerald-400 text-slate-950 font-bold text-xs rounded-xl disabled:opacity-40"
-              >
-                Rename
-              </button>
-            </div>
-          </div>
-        </div>
-      )}
-
-      {/* Modal: Delete File / Folder Confirmation */}
-      {deleteTarget && (
-        <div className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-black/60 backdrop-blur-sm animate-in fade-in">
-          <div className="glass-panel w-full max-w-sm rounded-2xl p-5 space-y-4 border border-rose-500/30">
-            <div className="flex items-center gap-3 text-rose-400">
-              <AlertTriangle className="w-5 h-5 shrink-0" />
-              <h3 className="text-sm font-bold text-white">Delete {deleteTarget.is_dir ? 'Folder' : 'File'}?</h3>
-            </div>
-            <p className="text-xs text-slate-300">
-              Are you sure you want to permanently remove <strong className="text-white font-mono">{deleteTarget.name}</strong>?
-              {deleteTarget.is_dir && ' All contents within this directory will be permanently removed.'}
-            </p>
-            <div className="flex justify-end gap-2 pt-2">
-              <button
-                onClick={() => setDeleteTarget(null)}
-                className="px-3 py-1.5 rounded-xl text-xs text-slate-400 hover:bg-white/[0.06]"
-              >
-                Cancel
-              </button>
-              <button
-                onClick={handleConfirmDelete}
-                className="px-4 py-1.5 bg-rose-600 hover:bg-rose-500 text-white font-bold text-xs rounded-xl"
-              >
-                Yes, Delete
-              </button>
-            </div>
-          </div>
-        </div>
-      )}
-
-      {/* ========================================================================= */}
-      {/* TAB 3: ENVIRONMENT VARIABLES AUTO-DETECTION FROM .env.example             */}
-      {/* ========================================================================= */}
+      {/* TAB 3: ENVIRONMENT (.env & .env.example) */}
       {activeTab === 'env' && (
-        <div className="glass-panel rounded-2xl p-6 space-y-5 max-w-4xl">
-          <div className="flex items-center justify-between flex-wrap gap-3">
+        <Card padding="lg" className="space-y-5 max-w-4xl">
+          <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3 pb-4 border-b border-[#181C24]">
             <div>
               <div className="flex items-center gap-2">
-                <h3 className="font-bold text-white text-base">Environment Configuration</h3>
-                {envData?.has_example && (
-                  <span className="text-[10px] px-2 py-0.5 rounded-full bg-emerald-500/20 text-emerald-300 border border-emerald-500/30 font-semibold flex items-center gap-1">
-                    <Sparkles className="w-3 h-3" />
-                    <span>.env.example detected</span>
-                  </span>
-                )}
+                <h3 className="text-sm font-semibold text-[#F3F5F8]">Environment Variables (.env)</h3>
+                {envData?.has_example && <Badge tone="success">.env.example synced</Badge>}
               </div>
-              <p className="text-xs text-slate-400 mt-1">
-                Parsed from <code className="text-slate-300">.env.example</code> template and saved to isolated <code className="text-slate-300">.env</code> in server root.
+              <p className="text-xs text-[#8A94A6] mt-0.5">
+                Synchronizes keys from <CodeText>.env.example</CodeText> and writes atomically to{' '}
+                <CodeText>.env</CodeText> inside the server workspace.
               </p>
             </div>
 
-            <div className="flex items-center gap-2 flex-wrap">
-              {envData?.has_example && (
-                <>
-                  <button
-                    onClick={handleApplyAllTemplates}
-                    className="flex items-center gap-1.5 px-3 py-1.5 text-xs text-cyan-300 hover:text-white bg-cyan-500/15 hover:bg-cyan-500/25 border border-cyan-500/30 rounded-xl transition-all font-medium"
-                    title="Isi otomatis semua field yang kosong dari template .env.example"
-                  >
-                    <Sparkles className="w-3.5 h-3.5" />
-                    <span>Isi dari Template</span>
-                  </button>
+            <div className="flex items-center gap-3 flex-wrap">
+              <Switch
+                checked={revealSecrets}
+                onChange={setRevealSecrets}
+                label="Reveal values"
+              />
 
-                  <button
-                    onClick={handleApplyAndSaveTemplate}
-                    disabled={isSavingEnv}
-                    className="flex items-center gap-1.5 px-3 py-1.5 text-xs text-amber-300 hover:text-white bg-amber-500/15 hover:bg-amber-500/25 border border-amber-500/30 rounded-xl transition-all font-semibold disabled:opacity-50"
-                    title="Terapkan semua nilai dari .env.example dan langsung simpan ke .env"
-                  >
-                    <Sparkles className="w-3.5 h-3.5" />
-                    <span>Terapkan & Simpan ke .env</span>
-                  </button>
-                </>
+              {envData?.has_example && (
+                <Button
+                  variant="secondary"
+                  size="sm"
+                  onClick={handleApplyAllTemplates}
+                  leftIcon={<Sparkles className="w-3.5 h-3.5 text-emerald-400" />}
+                >
+                  Fill Defaults
+                </Button>
               )}
 
-              <button
-                onClick={() => setRevealSecrets(!revealSecrets)}
-                className="flex items-center gap-1.5 px-3 py-1.5 text-xs text-slate-300 hover:text-white bg-white/[0.04] border border-white/[0.08] rounded-xl"
+              <Button
+                variant="primary"
+                size="sm"
+                loading={isSavingEnv}
+                onClick={() => void handleSaveEnvironment()}
+                leftIcon={<Save className="w-3.5 h-3.5" />}
               >
-                {revealSecrets ? <EyeOff className="w-3.5 h-3.5" /> : <Eye className="w-3.5 h-3.5" />}
-                <span>{revealSecrets ? 'Sembunyikan' : 'Tampilkan'}</span>
-              </button>
-
-              <button
-                onClick={handleSaveEnvironment}
-                disabled={isSavingEnv}
-                className="flex items-center gap-1.5 px-4 py-1.5 bg-emerald-500 hover:bg-emerald-400 text-slate-950 font-bold text-xs rounded-xl shadow-md transition-colors disabled:opacity-50"
-              >
-                <Save className="w-3.5 h-3.5" />
-                <span>{isSavingEnv ? 'Menyimpan...' : 'Simpan ke .env'}</span>
-              </button>
+                Save to .env
+              </Button>
             </div>
           </div>
 
-          {/* Banner if .env file is not yet saved but template is ready */}
           {!envData?.has_env && envData?.has_example && (
-            <div className="bg-emerald-500/10 border border-emerald-500/30 p-3 rounded-xl flex items-center justify-between gap-3 text-xs">
-              <div className="text-emerald-200 flex items-center gap-2">
-                <Sparkles className="w-4 h-4 text-emerald-400 shrink-0" />
-                <span>Template terdeteksi. Nilai default telah diisi otomatis. Tekan <strong>Simpan ke .env</strong> untuk mengaktifkan konfigurasi.</span>
-              </div>
-              <button
-                onClick={handleApplyAndSaveTemplate}
-                disabled={isSavingEnv}
-                className="px-3 py-1 bg-emerald-500 text-slate-950 font-bold text-xs rounded-lg shrink-0 hover:bg-emerald-400 transition-colors shadow"
-              >
-                Simpan ke .env Sekarang
-              </button>
-            </div>
+            <Alert
+              variant="info"
+              title="Template defaults detected"
+              action={
+                <Button
+                  variant="primary"
+                  size="sm"
+                  loading={isSavingEnv}
+                  onClick={() => void handleApplyAndSaveTemplate()}
+                >
+                  Apply &amp; Save .env
+                </Button>
+              }
+            >
+              Default values from <CodeText>.env.example</CodeText> are pre-filled below. Save to activate{' '}
+              <CodeText>.env</CodeText>.
+            </Alert>
           )}
 
-          {/* Banner if .env.example not found */}
-          {!envData?.has_example && (
-            <div className="bg-amber-500/10 border border-amber-500/25 p-3.5 rounded-xl flex items-center justify-between gap-3 text-xs">
-              <div className="text-amber-200">
-                <span>Tidak ditemukan template </span><code className="font-mono font-bold">.env.example</code><span> di root server. Anda dapat membuat template baru secara otomatis.</span>
-              </div>
-              <button
-                onClick={handleInitEnvExample}
-                className="px-3 py-1 bg-amber-500 text-slate-950 font-semibold text-xs rounded-lg shrink-0 hover:bg-amber-400"
-              >
-                Buat .env.example
-              </button>
-            </div>
+          {envData && !envData.has_example && (
+            <Alert
+              variant="warning"
+              title="No .env.example template found"
+              action={
+                <Button variant="secondary" size="sm" onClick={() => void handleInitEnvExample()}>
+                  Create .env.example
+                </Button>
+              }
+            >
+              Generate a starter <CodeText>.env.example</CodeText> file to document required runtime keys.
+            </Alert>
           )}
 
-          {/* Variable List */}
-          <div className="space-y-3">
-            {Object.keys(envValues).length === 0 ? (
-              <div className="p-8 text-center text-xs text-slate-500 italic bg-black/20 rounded-xl border border-white/[0.04]">
-                Belum ada variabel konfigurasi. Tambahkan variabel di bawah atau buat template baru.
-              </div>
-            ) : (
-              Object.entries(envValues).map(([key, val]) => {
+          {loadingEnv && !envData ? (
+            <div className="space-y-2">
+              <Skeleton className="h-16 w-full" />
+              <Skeleton className="h-16 w-full" />
+            </div>
+          ) : Object.keys(envValues).length === 0 ? (
+            <div className="py-8 text-center text-xs text-[#697386] rounded-lg border border-dashed border-[#242A35]">
+              No environment variables configured yet. Add a variable below.
+            </div>
+          ) : (
+            <div className="space-y-3">
+              {Object.entries(envValues).map(([key, val]) => {
                 const comment = envDescriptions[key];
                 const meta = envData?.variables.find((v) => v.key === key);
-                const isTemplate = meta?.source === 'example' || meta?.source === 'both';
 
                 return (
                   <div
                     key={key}
-                    className="bg-black/30 p-3 rounded-xl border border-white/[0.06] space-y-1.5"
+                    className="p-3.5 rounded-lg bg-[#090B0E] border border-[#1F242D] space-y-2"
                   >
-                    {/* Header: Key & Tag */}
-                    <div className="flex items-center justify-between">
+                    <div className="flex items-center justify-between gap-2">
                       <div className="flex items-center gap-2 flex-wrap">
-                        <span className="font-mono font-bold text-emerald-400 text-xs">{key}</span>
-                        {isTemplate && (
-                          <span className="text-[10px] px-1.5 py-0.2 rounded bg-cyan-500/15 text-cyan-300 border border-cyan-500/20">
-                            template
-                          </span>
-                        )}
+                        <span className="font-mono text-xs font-semibold text-emerald-400">{key}</span>
                         {meta?.example_value && (
-                          <span className="text-[10px] text-slate-500 font-mono">
-                            contoh: {meta.example_value}
+                          <span className="text-[11px] font-mono text-[#697386]">
+                            default: {meta.example_value}
                           </span>
                         )}
                       </div>
 
-                      <button
+                      <IconButton
+                        aria-label={`Remove ${key}`}
+                        size="sm"
+                        variant="ghost"
                         onClick={() => setDeleteEnvKey(key)}
-                        className="p-1 text-slate-500 hover:text-rose-400 rounded transition-colors"
-                        title="Hapus variabel"
-                      >
-                        <Trash2 className="w-3.5 h-3.5" />
-                      </button>
-                    </div>
-
-                    {/* Comment Description from .env.example */}
-                    {comment && (
-                      <p className="text-[11px] text-slate-400 italic">
-                        {comment}
-                      </p>
-                    )}
-
-                    {/* Value Input */}
-                    <div>
-                      <input
-                        type={revealSecrets ? 'text' : 'password'}
-                        value={val}
-                        placeholder={meta?.example_value ? `contoh: ${meta.example_value}` : 'nilai'}
-                        onChange={(e) => {
-                          const updated = e.target.value;
-                          setEnvValues((prev) => ({ ...prev, [key]: updated }));
-                        }}
-                        className="w-full bg-black/50 border border-white/[0.08] rounded-lg px-3 py-1.5 text-xs text-slate-100 font-mono focus:outline-none focus:border-emerald-500/50"
+                        className="h-7 w-7"
+                        icon={<Trash2 className="w-3.5 h-3.5 text-[#8A94A6] hover:text-red-400" />}
                       />
                     </div>
 
-                    {/* Quick Button to Use Example Value if current is empty or different */}
+                    {comment && <p className="text-[11px] text-[#8A94A6]">{comment}</p>}
+
+                    <PasswordInput
+                      aria-label={`Value for ${key}`}
+                      mono
+                      revealed={revealSecrets}
+                      onRevealChange={setRevealSecrets}
+                      value={val}
+                      placeholder={meta?.example_value || 'value'}
+                      onChange={(e) => {
+                        const next = e.target.value;
+                        setEnvValues((prev) => ({ ...prev, [key]: next }));
+                      }}
+                    />
+
                     {meta?.example_value && val !== meta.example_value && (
-                      <div className="pt-0.5">
-                        <button
-                          type="button"
-                          onClick={() => {
-                            setEnvValues((prev) => ({ ...prev, [key]: meta.example_value! }));
-                            showToast(`Menggunakan nilai contoh: ${meta.example_value}`, 'info');
-                          }}
-                          className="text-[10px] text-cyan-400 hover:text-cyan-300 font-mono flex items-center gap-1 transition-colors"
-                        >
-                          <Sparkles className="w-3 h-3" />
-                          <span>Gunakan nilai template: <span className="underline font-semibold">{meta.example_value}</span></span>
-                        </button>
-                      </div>
+                      <button
+                        type="button"
+                        onClick={() =>
+                          setEnvValues((prev) => ({ ...prev, [key]: meta.example_value! }))
+                        }
+                        className="text-[11px] font-mono text-emerald-400 hover:underline"
+                      >
+                        Use template value ({meta.example_value})
+                      </button>
                     )}
                   </div>
                 );
-              })
-            )}
-          </div>
-
-          {/* Add New Variable Form */}
-          <div className="pt-3 border-t border-white/[0.08] space-y-2">
-            <span className="text-xs font-semibold text-slate-300">Add Variable</span>
-            <div className="flex items-center gap-2 flex-wrap sm:flex-nowrap">
-              <input
-                type="text"
-                placeholder="VARIABLE_NAME"
-                value={newEnvKey}
-                onChange={(e) => setNewEnvKey(e.target.value.toUpperCase())}
-                className="w-full sm:w-1/3 bg-black/30 border border-white/[0.08] rounded-xl px-3 py-2 text-xs text-slate-100 placeholder-slate-600 font-mono"
-              />
-              <input
-                type="text"
-                placeholder="value"
-                value={newEnvVal}
-                onChange={(e) => setNewEnvVal(e.target.value)}
-                className="w-full sm:flex-1 bg-black/30 border border-white/[0.08] rounded-xl px-3 py-2 text-xs text-slate-100 placeholder-slate-600 font-mono"
-              />
-              <button
-                onClick={handleAddEnvVariable}
-                disabled={!newEnvKey.trim()}
-                className="w-full sm:w-auto px-4 py-2 bg-white/[0.08] hover:bg-white/[0.12] text-slate-200 text-xs font-semibold rounded-xl disabled:opacity-40 whitespace-nowrap"
-              >
-                Add
-              </button>
+              })}
             </div>
-          </div>
-        </div>
+          )}
+
+          <form
+            onSubmit={handleAddEnvVariable}
+            noValidate
+            className="pt-4 border-t border-[#181C24] space-y-2"
+          >
+            <div className="text-xs font-medium text-[#D0D7E2]">Add Custom Variable</div>
+            <div className="grid grid-cols-1 sm:grid-cols-12 gap-2.5 items-start">
+              <div className="sm:col-span-4">
+                <Input
+                  aria-label="New variable key"
+                  mono
+                  placeholder="KEY_NAME"
+                  value={newEnvKey}
+                  error={newEnvError || undefined}
+                  onChange={(e) => {
+                    setNewEnvKey(e.target.value.toUpperCase());
+                    if (newEnvError) setNewEnvError(null);
+                  }}
+                />
+              </div>
+              <div className="sm:col-span-6">
+                <Input
+                  aria-label="New variable value"
+                  mono
+                  placeholder="value"
+                  value={newEnvVal}
+                  onChange={(e) => setNewEnvVal(e.target.value)}
+                />
+              </div>
+              <div className="sm:col-span-2">
+                <Button type="submit" variant="secondary" size="md" fullWidth>
+                  Add Key
+                </Button>
+              </div>
+            </div>
+          </form>
+        </Card>
       )}
 
-      {/* Modal: Delete Environment Variable Confirmation */}
-      {deleteEnvKey && (
-        <div className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-black/60 backdrop-blur-sm animate-in fade-in">
-          <div className="glass-panel w-full max-w-sm rounded-2xl p-5 space-y-4 border border-rose-500/30">
-            <div className="flex items-center gap-3 text-rose-400">
-              <AlertTriangle className="w-5 h-5 shrink-0" />
-              <h3 className="text-sm font-bold text-white">Remove Variable?</h3>
-            </div>
-            <p className="text-xs text-slate-300">
-              Remove <strong className="text-white font-mono">{deleteEnvKey}</strong> from configuration? Remember to click Save afterwards.
-            </p>
-            <div className="flex justify-end gap-2 pt-2">
-              <button
-                onClick={() => setDeleteEnvKey(null)}
-                className="px-3 py-1.5 rounded-xl text-xs text-slate-400 hover:bg-white/[0.06]"
-              >
-                Cancel
-              </button>
-              <button
-                onClick={handleConfirmDeleteEnv}
-                className="px-4 py-1.5 bg-rose-600 hover:bg-rose-500 text-white font-bold text-xs rounded-xl"
-              >
-                Yes, Remove
-              </button>
-            </div>
-          </div>
-        </div>
-      )}
-
-      {/* ========================================================================= */}
-      {/* TAB 4: APP DAEMON LOGS                                                    */}
-      {/* ========================================================================= */}
+      {/* TAB 4: APP DAEMON LOGS */}
       {activeTab === 'logs' && (
-        <div className="glass-panel rounded-2xl overflow-hidden flex flex-col h-[520px]">
-          <div className="bg-black/30 px-4 py-2.5 border-b border-white/[0.06] flex items-center justify-between">
-            <div className="flex items-center gap-2">
-              <FileCode className="w-3.5 h-3.5 text-cyan-400" />
-              <span className="font-mono text-xs text-slate-300">Background Daemon Logs (server.log)</span>
+        <Card padding="none" className="overflow-hidden flex flex-col h-[520px]">
+          <div className="px-4 py-2.5 bg-[#0B0D10] border-b border-[#1F242D] flex items-center justify-between gap-2 flex-wrap">
+            <div className="flex items-center gap-2 font-mono text-xs text-[#D0D7E2]">
+              <FileCode className="w-3.5 h-3.5 text-emerald-400" aria-hidden="true" />
+              <span>logs/server.log</span>
             </div>
-            <div className="flex items-center gap-2">
-              <button
-                onClick={() => setAutoScrollLogs(!autoScrollLogs)}
-                className={`text-[11px] px-2.5 py-1 rounded-lg border transition-colors ${
-                  autoScrollLogs
-                    ? 'bg-emerald-500/15 text-emerald-300 border-emerald-500/30'
-                    : 'bg-white/[0.04] text-slate-400 border-white/[0.06]'
-                }`}
-              >
-                Auto-scroll: {autoScrollLogs ? 'ON' : 'OFF'}
-              </button>
-              <button
-                onClick={() => setAppLogs([])}
-                className="text-[11px] px-2.5 py-1 rounded-lg bg-white/[0.04] hover:bg-white/[0.08] text-slate-300 border border-white/[0.06]"
-              >
-                Clear
-              </button>
+
+            <div className="flex items-center gap-3">
+              <Switch
+                checked={autoScrollLogs}
+                onChange={setAutoScrollLogs}
+                label="Auto-scroll"
+              />
+              <Button variant="ghost" size="sm" onClick={() => void loadData()}>
+                Refresh
+              </Button>
+              <Button variant="ghost" size="sm" onClick={() => setAppLogs([])}>
+                Clear View
+              </Button>
             </div>
           </div>
 
-          <div className="flex-1 p-4 overflow-y-auto font-mono text-xs text-slate-200 space-y-1 bg-black/40">
+          <div className="flex-1 p-4 overflow-y-auto font-mono text-xs bg-[#060709] space-y-1 select-text">
             {appLogs.length === 0 ? (
-              <div className="text-slate-600 italic py-8 text-center">
-                [No daemon logs recorded. Start server to stream output.]
+              <div className="text-[#5B6475] py-8 text-center">
+                No daemon logs captured yet. Start the server to stream stdout/stderr output.
               </div>
             ) : (
               appLogs.map((line, idx) => (
-                <div key={idx} className="flex items-start gap-2 leading-relaxed break-all">
-                  <span className="text-slate-600 text-[10px] select-none shrink-0">
-                    {new Date(line.timestamp).toLocaleTimeString([], { hour12: false })}
+                <div key={idx} className="flex items-start gap-2.5 leading-relaxed break-all">
+                  <span className="text-[#5B6475] text-[11px] tabular-nums select-none shrink-0">
+                    {formatTimestampTime(line.timestamp)}
                   </span>
-                  <span className="text-slate-500 select-none text-[10px]">[{line.stream}]</span>
-                  <span className={line.stream === 'stderr' ? 'text-rose-400' : 'text-slate-300'}>
+                  <span className="text-[#697386] text-[11px] select-none shrink-0">
+                    [{line.stream}]
+                  </span>
+                  <span className={line.stream === 'stderr' ? 'text-red-400' : 'text-[#D0D7E2]'}>
                     {line.text}
                   </span>
                 </div>
@@ -1706,137 +1562,242 @@ export const ServerDetailView: React.FC<ServerDetailViewProps> = ({
             )}
             <div ref={logsBottomRef} />
           </div>
-        </div>
+        </Card>
       )}
 
-      {/* ========================================================================= */}
-      {/* TAB 5: LIFECYCLE SETTINGS                                                 */}
-      {/* ========================================================================= */}
+      {/* TAB 5: LIFECYCLE SETTINGS */}
       {activeTab === 'settings' && (
-        <form onSubmit={handleSaveConfig} className="glass-panel rounded-2xl p-6 space-y-4 max-w-xl">
-          <h3 className="font-bold text-white text-base">Lifecycle Configuration</h3>
+        <Card padding="lg" className="max-w-xl">
+          <form onSubmit={handleSaveConfig} noValidate className="space-y-4">
+            <h3 className="text-sm font-semibold text-[#F3F5F8]">Lifecycle Configuration</h3>
 
-          <div>
-            <label className="block text-xs font-medium text-slate-300 mb-1">Server Name</label>
-            <input
-              type="text"
+            <Input
+              label="Server Name"
+              required
               value={cfgName}
+              error={cfgErrors.name}
               onChange={(e) => setCfgName(e.target.value)}
-              className="w-full bg-black/30 border border-white/[0.08] rounded-xl px-3 py-2 text-xs text-slate-100"
             />
-          </div>
 
-          <div className="grid grid-cols-2 gap-3">
-            <div>
-              <label className="block text-xs font-medium text-slate-300 mb-1">Assigned Port</label>
-              <input
+            <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
+              <Input
+                label="Listening Port"
                 type="number"
+                mono
                 value={cfgPort}
-                onChange={(e) => setCfgPort(parseInt(e.target.value) || 3001)}
-                className="w-full bg-black/30 border border-white/[0.08] rounded-xl px-3 py-2 text-xs text-slate-100 font-mono"
+                error={cfgErrors.port}
+                onChange={(e) => setCfgPort(e.target.value)}
               />
-            </div>
-            <div>
-              <label className="block text-xs font-medium text-slate-300 mb-1">Auto-Restart Policy</label>
-              <select
+
+              <Select
+                label="Auto-Restart Policy"
                 value={cfgAutoRestart}
                 onChange={(e) => setCfgAutoRestart(e.target.value as AutoRestartPolicy)}
-                className="w-full bg-black/30 border border-white/[0.08] rounded-xl px-3 py-2 text-xs text-slate-100"
-              >
-                <option value="never">Never</option>
-                <option value="on-failure">On-Failure</option>
-                <option value="always">Always</option>
-              </select>
+                options={[
+                  { value: 'never', label: 'Never' },
+                  { value: 'on-failure', label: 'On-Failure (Max 5)' },
+                  { value: 'always', label: 'Always (Bounded)' },
+                ]}
+              />
             </div>
-          </div>
 
-          <div>
-            <label className="block text-xs font-medium text-slate-300 mb-1">Entry Script</label>
-            <input
-              type="text"
+            <Input
+              label="Entry Command / Script"
+              mono
               value={cfgEntry}
+              error={cfgErrors.entry}
               onChange={(e) => setCfgEntry(e.target.value)}
-              className="w-full bg-black/30 border border-white/[0.08] rounded-xl px-3 py-2 text-xs text-slate-100 font-mono"
             />
-          </div>
 
-          <div>
-            <label className="block text-xs font-medium text-slate-300 mb-1">Description</label>
-            <textarea
+            <Textarea
+              label="Description"
               rows={2}
               value={cfgDesc}
               onChange={(e) => setCfgDesc(e.target.value)}
-              className="w-full bg-black/30 border border-white/[0.08] rounded-xl px-3 py-2 text-xs text-slate-100"
             />
-          </div>
 
-          <div className="pt-2">
-            <button
-              type="submit"
-              disabled={isSavingCfg}
-              className="px-4 py-2 bg-emerald-500 hover:bg-emerald-400 text-slate-950 font-bold text-xs rounded-xl shadow-md transition-colors"
-            >
-              {isSavingCfg ? 'Saving...' : 'Save Configuration'}
-            </button>
-          </div>
-        </form>
+            <div className="pt-2">
+              <Button
+                type="submit"
+                variant="primary"
+                size="md"
+                loading={isSavingCfg}
+                leftIcon={<Save className="w-3.5 h-3.5" />}
+              >
+                Save Configuration
+              </Button>
+            </div>
+          </form>
+        </Card>
       )}
 
-      {/* ========================================================================= */}
-      {/* TAB 6: GIT SETTINGS                                                       */}
-      {/* ========================================================================= */}
+      {/* TAB 6: GIT REPOSITORY */}
       {activeTab === 'git' && (
-        <div className="glass-panel rounded-2xl p-6 space-y-4 max-w-2xl">
-          <h3 className="font-bold text-white text-base">Git Repository Association</h3>
-          <p className="text-xs text-slate-400 leading-relaxed">
-            Local repository synchronization and branch management.
-          </p>
+        <Card padding="lg" className="max-w-2xl space-y-4">
+          <div>
+            <h3 className="text-sm font-semibold text-[#F3F5F8]">Git Workspace Metadata</h3>
+            <p className="text-xs text-[#8A94A6] mt-0.5">
+              Repository origin and local sandboxed filesystem location for this server instance.
+            </p>
+          </div>
 
-          <div className="bg-black/30 p-4 rounded-xl border border-white/[0.06] space-y-2 text-xs font-mono">
-            <div>
-              <span className="text-slate-500 block text-[10px]">REPOSITORY ORIGIN</span>
-              <span className="text-slate-200">{server.repo_url || 'No remote repository attached'}</span>
+          <div className="rounded-lg bg-[#090B0E] border border-[#1A1E26] divide-y divide-[#181C24] text-xs font-mono">
+            <div className="px-4 py-3 flex flex-col sm:flex-row sm:items-center justify-between gap-1">
+              <span className="text-[#8A94A6] font-sans">Repository Origin</span>
+              <span className="text-[#F3F5F8] break-all">
+                {server.repo_url || 'Provisioned from local template (no remote origin)'}
+              </span>
             </div>
-            <div>
-              <span className="text-slate-500 block text-[10px]">LOCAL WORKING DIRECTORY</span>
+            <div className="px-4 py-3 flex flex-col sm:flex-row sm:items-center justify-between gap-1">
+              <span className="text-[#8A94A6] font-sans">Workspace Directory</span>
               <span className="text-emerald-400">data/servers/{server.id}</span>
             </div>
           </div>
-        </div>
+        </Card>
       )}
 
-      {/* Modal: Delete Server Confirmation */}
-      {showDeleteServerModal && (
-        <div className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-black/60 backdrop-blur-sm animate-in fade-in">
-          <div className="glass-panel w-full max-w-sm rounded-2xl p-5 space-y-4 border border-rose-500/30">
-            <div className="flex items-center gap-3 text-rose-400">
-              <AlertTriangle className="w-5 h-5 shrink-0" />
-              <h3 className="text-sm font-bold text-white">Delete Server Instance?</h3>
-            </div>
-            <p className="text-xs text-slate-300">
-              Are you sure you want to permanently delete server <strong className="text-white font-mono">{server.name}</strong>?
-              All code and files in <code className="text-slate-200 font-mono">data/servers/{server.id}</code> will be removed.
-            </p>
-            <div className="flex justify-end gap-2 pt-2">
-              <button
-                onClick={() => setShowDeleteServerModal(false)}
-                className="px-3 py-1.5 rounded-xl text-xs text-slate-400 hover:bg-white/[0.06]"
-              >
-                Cancel
-              </button>
-              <button
-                onClick={() => {
-                  setShowDeleteServerModal(false);
-                  onDelete(server.id);
-                }}
-                className="px-4 py-1.5 bg-rose-600 hover:bg-rose-500 text-white font-bold text-xs rounded-xl"
-              >
-                Yes, Delete Server
-              </button>
-            </div>
-          </div>
-        </div>
-      )}
+      {/* Modals & Confirmations */}
+      <Modal
+        isOpen={showNewFileModal}
+        onClose={() => setShowNewFileModal(false)}
+        title="Create New File"
+        size="sm"
+        footer={
+          <>
+            <Button variant="ghost" size="sm" onClick={() => setShowNewFileModal(false)}>
+              Cancel
+            </Button>
+            <Button type="submit" form="new-file-form" variant="primary" size="sm">
+              Create File
+            </Button>
+          </>
+        }
+      >
+        <form id="new-file-form" onSubmit={handleConfirmCreateFile} noValidate>
+          <Input
+            label="File Name"
+            mono
+            placeholder="e.g. routes.js or config.json"
+            value={newFileName}
+            error={newFileError || undefined}
+            onChange={(e) => {
+              setNewFileName(e.target.value);
+              if (newFileError) setNewFileError(null);
+            }}
+          />
+        </form>
+      </Modal>
+
+      <Modal
+        isOpen={showNewFolderModal}
+        onClose={() => setShowNewFolderModal(false)}
+        title="Create New Folder"
+        size="sm"
+        footer={
+          <>
+            <Button variant="ghost" size="sm" onClick={() => setShowNewFolderModal(false)}>
+              Cancel
+            </Button>
+            <Button type="submit" form="new-folder-form" variant="primary" size="sm">
+              Create Folder
+            </Button>
+          </>
+        }
+      >
+        <form id="new-folder-form" onSubmit={handleConfirmCreateFolder} noValidate>
+          <Input
+            label="Folder Name"
+            mono
+            placeholder="e.g. src or controllers"
+            value={newFolderName}
+            error={newFolderError || undefined}
+            onChange={(e) => {
+              setNewFolderName(e.target.value);
+              if (newFolderError) setNewFolderError(null);
+            }}
+          />
+        </form>
+      </Modal>
+
+      <Modal
+        isOpen={Boolean(renameTarget)}
+        onClose={() => setRenameTarget(null)}
+        title={`Rename ${renameTarget?.is_dir ? 'Folder' : 'File'}`}
+        size="sm"
+        footer={
+          <>
+            <Button variant="ghost" size="sm" onClick={() => setRenameTarget(null)}>
+              Cancel
+            </Button>
+            <Button type="submit" form="rename-entry-form" variant="primary" size="sm">
+              Rename
+            </Button>
+          </>
+        }
+      >
+        <form id="rename-entry-form" onSubmit={handleConfirmRename} noValidate>
+          <Input
+            label="New Name"
+            mono
+            value={renameNewName}
+            error={renameError || undefined}
+            onChange={(e) => {
+              setRenameNewName(e.target.value);
+              if (renameError) setRenameError(null);
+            }}
+          />
+        </form>
+      </Modal>
+
+      <ConfirmDialog
+        isOpen={Boolean(deleteTarget)}
+        onClose={() => setDeleteTarget(null)}
+        onConfirm={() => void handleConfirmDeleteFile()}
+        title={`Delete ${deleteTarget?.is_dir ? 'Folder' : 'File'}?`}
+        confirmLabel="Delete"
+        description={
+          deleteTarget ? (
+            <>
+              Permanently remove <CodeText>{deleteTarget.name}</CodeText>?
+              {deleteTarget.is_dir && ' All nested files inside this folder will also be deleted.'}
+            </>
+          ) : null
+        }
+      />
+
+      <ConfirmDialog
+        isOpen={Boolean(deleteEnvKey)}
+        onClose={() => setDeleteEnvKey(null)}
+        onConfirm={handleConfirmDeleteEnv}
+        title="Remove Environment Variable?"
+        confirmLabel="Remove"
+        description={
+          deleteEnvKey ? (
+            <>
+              Remove <CodeText>{deleteEnvKey}</CodeText> from the editor? Remember to click{' '}
+              <strong>Save to .env</strong> to apply changes on disk.
+            </>
+          ) : null
+        }
+      />
+
+      <ConfirmDialog
+        isOpen={showDeleteServerModal}
+        onClose={() => setShowDeleteServerModal(false)}
+        onConfirm={() => {
+          setShowDeleteServerModal(false);
+          onDelete(server.id);
+        }}
+        title="Delete Server Instance?"
+        confirmLabel="Delete Server"
+        loading={pendingAction === 'deleting'}
+        description={
+          <>
+            Permanently terminate and delete <strong className="text-[#F3F5F8]">{server.name}</strong>{' '}
+            along with <CodeText>data/servers/{server.id}</CodeText>?
+          </>
+        }
+      />
     </div>
   );
 };

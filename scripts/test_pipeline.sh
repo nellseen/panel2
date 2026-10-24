@@ -1,21 +1,46 @@
 #!/usr/bin/env bash
-set -e
+set -euo pipefail
 
 echo "================================================================="
-echo "        TERMUX NODEPANEL — COMPREHENSIVE TEST PIPELINE           "
+echo "        TERMUX NODEPANEL — 5-STAGE AUTOMATED TEST PIPELINE       "
 echo "================================================================="
 
 echo ""
-echo ">>> STAGE 1: Static Checks & Compilation Validation"
-echo "[*] Running TypeScript type check (tsc --noEmit)..."
+echo ">>> STAGE 1: Static Typecheck, ESLint & Production Build"
+npm run typecheck
+echo "    [PASS] TypeScript typecheck passed"
+
 npm run lint
-echo "    [PASS] TypeScript passed"
+echo "    [PASS] ESLint static analysis passed"
 
-echo "[*] Building React static assets with Vite..."
+echo ""
+echo ">>> STAGE 2: Unit & Regression Tests (Vitest + Testing Library)"
+npm run test:unit
+echo "    [PASS] Unit tests passed"
+
+echo ""
+echo ">>> STAGE 3: Isolated API, Process Lifecycle & WS Integration Tests"
+npm run test:integration
+echo "    [PASS] Integration tests passed"
+
+echo ""
+echo ">>> Building Production Assets (Vite)"
 npm run build
-echo "    [PASS] Frontend Vite build passed"
+echo "    [PASS] Production bundle built cleanly"
+
+echo ""
+echo ">>> STAGE 4: Playwright End-to-End Browser Automation"
+npm run test:e2e
+echo "    [PASS] E2E browser suite passed"
+
+if [[ "${RUN_LOAD_TEST:-0}" == "1" ]]; then
+  echo ""
+  echo ">>> STAGE 5: Staged HTTP & WebSocket Load Test"
+  npm run test:load
+  echo "    [PASS] Stage 5 load test passed"
+fi
 
 echo ""
 echo "================================================================="
-echo "       ALL TEST STAGES COMPLETED SUCCESSFULLY WITH 0 FAILURES    "
+echo "       ALL PIPELINE STAGES COMPLETED WITH 0 FAILURES             "
 echo "================================================================="

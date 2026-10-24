@@ -1,33 +1,52 @@
-import React, { useState, useEffect, useCallback } from 'react';
+import React, { Suspense, lazy, useCallback, useEffect, useRef, useState } from 'react';
 import { Navbar } from './components/Navbar';
-import { Sidebar, TabType } from './components/Sidebar';
+import { Sidebar } from './components/Sidebar';
+import { MobileBottomNav } from './components/MobileBottomNav';
 import { DashboardView } from './components/DashboardView';
 import { ServerListView } from './components/ServerListView';
-import { ServerDetailView } from './components/ServerDetailView';
-import { PackagesView } from './components/PackagesView';
-import { DiagnosticsView } from './components/DiagnosticsView';
-import { ActivityLogsView } from './components/ActivityLogsView';
-import { SettingsView } from './components/SettingsView';
 import { CreateServerModal } from './components/CreateServerModal';
-import { FloatingNavBar } from './components/FloatingNavBar';
+import { Alert, Button, ErrorBoundary, Skeleton, ToastViewport } from './components/ui';
+
+const ServerDetailView = lazy(() =>
+  import('./components/ServerDetailView').then((m) => ({ default: m.ServerDetailView }))
+);
+const PackagesView = lazy(() =>
+  import('./components/PackagesView').then((m) => ({ default: m.PackagesView }))
+);
+const DiagnosticsView = lazy(() =>
+  import('./components/DiagnosticsView').then((m) => ({ default: m.DiagnosticsView }))
+);
+const ActivityLogsView = lazy(() =>
+  import('./components/ActivityLogsView').then((m) => ({ default: m.ActivityLogsView }))
+);
+const SettingsView = lazy(() =>
+  import('./components/SettingsView').then((m) => ({ default: m.SettingsView }))
+);
 
 import {
-  ServerModel,
-  EnvironmentInfo,
   ActivityLog,
+  ConnectionSnapshot,
   CreateServerPayload,
+  EnvironmentInfo,
+  PendingServerAction,
+  ServerModel,
+  ServerStatus,
+  TabType,
+  ToastItem,
 } from './types';
 import {
-  fetchRuntime,
-  fetchServers,
   createServer,
-  startServer,
-  stopServer,
-  restartServer,
   deleteServer,
   fetchActivities,
+  fetchRuntime,
+  fetchServers,
+  restartServer,
+  startServer,
+  stopServer,
   wsClient,
 } from './services/api';
+import { isAbortError, normalizeError } from './utils/errors';
+import { applyServerStatusUpdate, reconcileServerList } from './utils/serverLifecycle';
 
 export default function App() {
   const [currentTab, setCurrentTab] = useState<TabType>('dashboard');
@@ -37,123 +56,260 @@ export default function App() {
   const [servers, setServers] = useState<ServerModel[]>([]);
   const [activities, setActivities] = useState<ActivityLog[]>([]);
 
-  const [wsConnected, setWsConnected] = useState(false);
+  const [initialLoading, setInitialLoading] = useState(true);
   const [isRefreshing, setIsRefreshing] = useState(false);
+  const [isStale, setIsStale] = useState(false);
+  const [syncError, setSyncError] = useState<string | null>(null);
+  const [lastSyncedAt, setLastSyncedAt] = useState<string | null>(null);
+
+  const [connectionSnap, setConnectionSnap] = useState<ConnectionSnapshot>(() =>
+    wsClient.getSnapshot()
+  );
+  const [pendingActions, setPendingActions] = useState<Record<string, PendingServerAction>>({});
+
   const [isCreateModalOpen, setIsCreateModalOpen] = useState(false);
   const [isMobileSidebarOpen, setIsMobileSidebarOpen] = useState(false);
-  const [toast, setToast] = useState<{ message: string; type: 'success' | 'error' } | null>(null);
+  const [toasts, setToasts] = useState<ToastItem[]>([]);
 
-  const showToast = (message: string, type: 'success' | 'error' = 'success') => {
-    setToast({ message, type });
-    setTimeout(() => setToast(null), 4000);
-  };
+  const syncSeqRef = useRef(0);
+  const activeAbortRef = useRef<AbortController | null>(null);
+  const mountedRef = useRef(true);
 
-  const loadAll = useCallback(async () => {
-    try {
+  const pushToast = useCallback(
+    (
+      title: string,
+      variant: ToastItem['variant'] = 'success',
+      description?: string
+    ) => {
+      const id = `toast-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`;
+      setToasts((prev) => [...prev.slice(-3), { id, title, variant, description }]);
+      globalThis.setTimeout(() => {
+        if (mountedRef.current) {
+          setToasts((prev) => prev.filter((t) => t.id !== id));
+        }
+      }, 4200);
+    },
+    []
+  );
+
+  const dismissToast = useCallback((id: string) => {
+    setToasts((prev) => prev.filter((t) => t.id !== id));
+  }, []);
+
+  /**
+   * Non-destructive state synchronization:
+   * - Cancels superseded in-flight polls via AbortController
+   * - Preserves last valid servers/runtime/activities on transient network or 5xx errors
+   * - Surfaces explicit stale/offline warning instead of wiping UI to empty state
+   */
+  const syncAll = useCallback(async (opts: { silent?: boolean } = {}) => {
+    const seq = ++syncSeqRef.current;
+
+    if (activeAbortRef.current) {
+      activeAbortRef.current.abort();
+    }
+    const controller = new AbortController();
+    activeAbortRef.current = controller;
+
+    if (!opts.silent) {
       setIsRefreshing(true);
-      const [rtData, srvData, actData] = await Promise.all([
-        fetchRuntime().catch(() => null),
-        fetchServers().catch(() => []),
-        fetchActivities().catch(() => []),
+    }
+
+    try {
+      const [rtRes, srvRes, actRes] = await Promise.allSettled([
+        fetchRuntime({ signal: controller.signal }),
+        fetchServers({ signal: controller.signal }),
+        fetchActivities({ signal: controller.signal }),
       ]);
 
-      if (rtData) setRuntime(rtData);
-      setServers(srvData);
-      setActivities(actData);
-    } catch (err: any) {
-      console.error('Failed to refresh data:', err);
+      if (!mountedRef.current || seq !== syncSeqRef.current || controller.signal.aborted) {
+        return;
+      }
+
+      if (rtRes.status === 'fulfilled') {
+        setRuntime(rtRes.value);
+      }
+
+      if (actRes.status === 'fulfilled') {
+        setActivities(actRes.value);
+      }
+
+      if (srvRes.status === 'fulfilled') {
+        setServers((prev) => reconcileServerList(prev, srvRes.value));
+        setIsStale(false);
+        setSyncError(null);
+        setLastSyncedAt(new Date().toISOString());
+      } else if (!isAbortError(srvRes.reason)) {
+        const normalized = normalizeError(srvRes.reason, 'Unable to reach panel backend');
+        setIsStale(true);
+        setSyncError(normalized.message);
+      }
     } finally {
-      setIsRefreshing(false);
+      if (mountedRef.current && seq === syncSeqRef.current) {
+        setIsRefreshing(false);
+        setInitialLoading(false);
+      }
     }
   }, []);
 
   useEffect(() => {
-    loadAll();
+    mountedRef.current = true;
+    const bootTimer = globalThis.setTimeout(() => {
+      void syncAll({ silent: true });
+    }, 0);
 
     wsClient.connect();
 
-    const unsubConn = wsClient.on('connection', (data: any) => {
-      setWsConnected(data.status === 'open');
+    const unsubConn = wsClient.on<{
+      state: ConnectionSnapshot['state'];
+      reconnectAttempt: number;
+      nextRetryMs: number | null;
+      lastConnectedAt: string | null;
+    }>('connection', (data) => {
+      if (!mountedRef.current) return;
+      setConnectionSnap({
+        state: data.state,
+        reconnectAttempt: data.reconnectAttempt,
+        nextRetryMs: data.nextRetryMs,
+        lastConnectedAt: data.lastConnectedAt,
+      });
     });
 
-    const unsubStatus = wsClient.on('status', (data: any) => {
+    const unsubStatus = wsClient.on<{
+      server_id: string;
+      new_status: ServerStatus;
+      exit_code: number;
+    }>('status', (data) => {
+      if (!mountedRef.current || !data?.server_id) return;
       setServers((prev) =>
-        prev.map((s) =>
-          s.id === data.server_id
-            ? { ...s, status: data.new_status, last_exit_code: data.exit_code }
-            : s
+        prev.map((srv) =>
+          srv.id === data.server_id
+            ? applyServerStatusUpdate(srv, data.new_status, data.exit_code)
+            : srv
         )
       );
     });
 
-    const interval = setInterval(() => {
-      fetchServers().then(setServers).catch(() => {});
-      fetchActivities().then(setActivities).catch(() => {});
+    const unsubReconnected = wsClient.on('reconnected', () => {
+      if (!mountedRef.current) return;
+      void syncAll({ silent: true });
+    });
+
+    const pollTimer = globalThis.setInterval(() => {
+      void syncAll({ silent: true });
     }, 5000);
 
     return () => {
+      mountedRef.current = false;
+      globalThis.clearTimeout(bootTimer);
+      globalThis.clearInterval(pollTimer);
+      activeAbortRef.current?.abort();
       unsubConn();
       unsubStatus();
-      clearInterval(interval);
+      unsubReconnected();
       wsClient.disconnect();
     };
-  }, [loadAll]);
+  }, [syncAll]);
 
-  const handleStartServer = async (id: string) => {
-    try {
-      await startServer(id);
-      showToast('Process start initiated', 'success');
-      loadAll();
-    } catch (err: any) {
-      showToast(err.message, 'error');
-    }
-  };
-
-  const handleStopServer = async (id: string) => {
-    try {
-      await stopServer(id);
-      showToast('Stop signal sent', 'success');
-      loadAll();
-    } catch (err: any) {
-      showToast(err.message, 'error');
-    }
-  };
-
-  const handleRestartServer = async (id: string) => {
-    try {
-      await restartServer(id);
-      showToast('Restart sequence triggered', 'success');
-      loadAll();
-    } catch (err: any) {
-      showToast(err.message, 'error');
-    }
-  };
-
-  const handleDeleteServer = async (id: string) => {
-    try {
-      await deleteServer(id);
-      showToast('Server deleted successfully', 'success');
-      if (activeServerId === id) {
-        setActiveServerId(null);
-        setCurrentTab('servers');
+  const setServerPending = useCallback((id: string, action?: PendingServerAction) => {
+    setPendingActions((prev) => {
+      if (!action) {
+        const next = { ...prev };
+        delete next[id];
+        return next;
       }
-      loadAll();
-    } catch (err: any) {
-      showToast(err.message, 'error');
-    }
-  };
+      return { ...prev, [id]: action };
+    });
+  }, []);
 
-  const handleCreateServer = async (payload: CreateServerPayload) => {
-    const created = await createServer(payload);
-    showToast(`Created server ${created.name}`, 'success');
-    await loadAll();
-    setActiveServerId(created.id);
-  };
+  const handleStartServer = useCallback(
+    async (id: string) => {
+      setServerPending(id, 'starting');
+      try {
+        await startServer(id);
+        pushToast('Server started', 'success', 'Managed Node.js process is online.');
+        await syncAll({ silent: true });
+      } catch (err: unknown) {
+        const normalized = normalizeError(err, 'Failed to start server');
+        pushToast('Start failed', 'error', normalized.message);
+      } finally {
+        setServerPending(id, undefined);
+      }
+    },
+    [pushToast, setServerPending, syncAll]
+  );
 
-  const getCurrentFeatureName = () => {
+  const handleStopServer = useCallback(
+    async (id: string) => {
+      setServerPending(id, 'stopping');
+      try {
+        await stopServer(id);
+        pushToast('Server stopped', 'info', 'Process group terminated cleanly.');
+        await syncAll({ silent: true });
+      } catch (err: unknown) {
+        const normalized = normalizeError(err, 'Failed to stop server');
+        pushToast('Stop failed', 'error', normalized.message);
+      } finally {
+        setServerPending(id, undefined);
+      }
+    },
+    [pushToast, setServerPending, syncAll]
+  );
+
+  const handleRestartServer = useCallback(
+    async (id: string) => {
+      setServerPending(id, 'restarting');
+      try {
+        await restartServer(id);
+        pushToast('Server restarted', 'success', 'Clean process cycle completed.');
+        await syncAll({ silent: true });
+      } catch (err: unknown) {
+        const normalized = normalizeError(err, 'Failed to restart server');
+        pushToast('Restart failed', 'error', normalized.message);
+      } finally {
+        setServerPending(id, undefined);
+      }
+    },
+    [pushToast, setServerPending, syncAll]
+  );
+
+  const handleDeleteServer = useCallback(
+    async (id: string) => {
+      setServerPending(id, 'deleting');
+      try {
+        await deleteServer(id);
+        setServers((prev) => prev.filter((s) => s.id !== id));
+        if (activeServerId === id) {
+          setActiveServerId(null);
+          setCurrentTab('servers');
+        }
+        pushToast('Server deleted', 'success', 'Instance workspace and records removed.');
+        await syncAll({ silent: true });
+      } catch (err: unknown) {
+        const normalized = normalizeError(err, 'Failed to delete server');
+        pushToast('Delete failed', 'error', normalized.message);
+      } finally {
+        setServerPending(id, undefined);
+      }
+    },
+    [activeServerId, pushToast, setServerPending, syncAll]
+  );
+
+  const handleCreateServer = useCallback(
+    async (payload: CreateServerPayload) => {
+      const created = await createServer(payload);
+      setServers((prev) => reconcileServerList(prev, [...prev, created]));
+      pushToast(`Created ${created.name}`, 'success', `Assigned port :${created.port}`);
+      await syncAll({ silent: true });
+      setActiveServerId(created.id);
+    },
+    [pushToast, syncAll]
+  );
+
+  const getCurrentFeatureName = (): string => {
     if (activeServerId) {
       const activeSrv = servers.find((s) => s.id === activeServerId);
-      return activeSrv ? `servers / ${activeSrv.name}` : 'server details';
+      return activeSrv ? `servers / ${activeSrv.name}` : `servers / ${activeServerId}`;
     }
     switch (currentTab) {
       case 'dashboard':
@@ -169,111 +325,31 @@ export default function App() {
       case 'settings':
         return 'settings';
       default:
-        return 'dashboard';
+        return 'overview';
     }
   };
 
+  const activeServerSummary = activeServerId
+    ? servers.find((s) => s.id === activeServerId) ?? null
+    : null;
+
   return (
-    <div className="h-[100dvh] max-h-[100dvh] overflow-hidden bg-slate-950 text-slate-100 flex justify-center font-sans antialiased relative selection:bg-emerald-500/30 selection:text-emerald-300">
-      {/* Ambient Mobile Glow */}
-      <div className="fixed inset-0 pointer-events-none overflow-hidden z-0">
-        <div className="absolute -top-[10%] left-1/2 -translate-x-1/2 w-96 h-96 rounded-full bg-emerald-500/[0.07] blur-[100px]" />
-        <div className="absolute top-[40%] left-1/2 -translate-x-1/2 w-80 h-80 rounded-full bg-cyan-500/[0.06] blur-[110px]" />
-      </div>
+    <div className="min-h-[100dvh] h-[100dvh] bg-[#08090B] text-[#F3F5F8] flex flex-col overflow-hidden antialiased selection:bg-emerald-500/25 selection:text-emerald-200">
+      <Navbar
+        runtime={runtime}
+        connectionState={connectionSnap.state}
+        reconnectAttempt={connectionSnap.reconnectAttempt}
+        isStale={isStale}
+        lastSyncedAt={lastSyncedAt}
+        onOpenCreate={() => setIsCreateModalOpen(true)}
+        onRefresh={() => void syncAll()}
+        isRefreshing={isRefreshing}
+        onToggleMobileSidebar={() => setIsMobileSidebarOpen((v) => !v)}
+        currentFeatureName={getCurrentFeatureName()}
+      />
 
-      {/* Strict Mobile Canvas Container (Tailored for Mobile Phone Viewport) */}
-      <div className="w-full max-w-md mx-auto h-[100dvh] max-h-[100dvh] flex flex-col bg-slate-950/90 backdrop-blur-xl border-x border-white/[0.08] shadow-[0_0_50px_rgba(0,0,0,0.8)] relative overflow-hidden">
-        {/* Toast Notification */}
-        {toast && (
-          <div className="fixed top-16 inset-x-0 max-w-sm mx-auto px-4 z-50 animate-in fade-in slide-in-from-top-2 duration-200">
-            <div
-              className={`px-3.5 py-2 rounded-xl shadow-2xl text-xs font-semibold border backdrop-blur-xl flex items-center justify-center gap-2 ${
-                toast.type === 'error'
-                  ? 'bg-rose-950/95 text-rose-200 border-rose-500/40 shadow-[0_0_20px_rgba(244,63,94,0.3)]'
-                  : 'bg-emerald-950/95 text-emerald-200 border-emerald-500/40 shadow-[0_0_20px_rgba(16,185,129,0.3)]'
-              }`}
-            >
-              <span>{toast.message}</span>
-            </div>
-          </div>
-        )}
-
-        {/* Top Navbar - Fixed Anchor */}
-        <Navbar
-          runtime={runtime}
-          wsConnected={wsConnected}
-          onOpenCreate={() => setIsCreateModalOpen(true)}
-          onRefresh={loadAll}
-          isRefreshing={isRefreshing}
-          onOpenDiagnostics={() => {
-            setActiveServerId(null);
-            setCurrentTab('diagnostics');
-          }}
-          currentFeatureName={getCurrentFeatureName()}
-        />
-
-        {/* Mobile Viewport Main Body (with safe bottom padding for FloatingNavBar) */}
-        <main className="flex-1 px-3 py-3.5 pb-28 overflow-y-auto overscroll-y-contain">
-          {activeServerId ? (
-            <ServerDetailView
-              serverId={activeServerId}
-              onBack={() => {
-                setActiveServerId(null);
-                setCurrentTab('servers');
-              }}
-              onStart={handleStartServer}
-              onStop={handleStopServer}
-              onRestart={handleRestartServer}
-              onDelete={handleDeleteServer}
-            />
-          ) : (
-            <>
-              {currentTab === 'dashboard' && (
-                <DashboardView
-                  servers={servers}
-                  runtime={runtime}
-                  activities={activities}
-                  onOpenCreate={() => setIsCreateModalOpen(true)}
-                  onSelectServer={(id) => setActiveServerId(id)}
-                  onStartServer={handleStartServer}
-                  onStopServer={handleStopServer}
-                  onRestartServer={handleRestartServer}
-                  onNavigateTab={(tab) => {
-                    setActiveServerId(null);
-                    setCurrentTab(tab);
-                  }}
-                />
-              )}
-
-              {currentTab === 'servers' && (
-                <ServerListView
-                  servers={servers}
-                  onOpenCreate={() => setIsCreateModalOpen(true)}
-                  onSelectServer={(id) => setActiveServerId(id)}
-                  onStartServer={handleStartServer}
-                  onStopServer={handleStopServer}
-                  onRestartServer={handleRestartServer}
-                  onDeleteServer={handleDeleteServer}
-                />
-              )}
-
-              {currentTab === 'packages' && <PackagesView runtime={runtime} />}
-
-              {currentTab === 'diagnostics' && (
-                <DiagnosticsView runtime={runtime} onRefresh={loadAll} />
-              )}
-
-              {currentTab === 'activity' && (
-                <ActivityLogsView activities={activities} onRefresh={loadAll} />
-              )}
-
-              {currentTab === 'settings' && <SettingsView runtime={runtime} />}
-            </>
-          )}
-        </main>
-
-        {/* Custom Floating Navigation Bar */}
-        <FloatingNavBar
+      <div className="flex-1 flex min-h-0 overflow-hidden">
+        <Sidebar
           currentTab={currentTab}
           onSelectTab={(tab) => {
             setActiveServerId(null);
@@ -281,21 +357,128 @@ export default function App() {
           }}
           servers={servers}
           activeServerId={activeServerId}
-          onClearActiveServer={() => setActiveServerId(null)}
+          onSelectServer={(id) => setActiveServerId(id)}
           onOpenCreate={() => setIsCreateModalOpen(true)}
+          isOpenMobile={isMobileSidebarOpen}
+          onCloseMobile={() => setIsMobileSidebarOpen(false)}
         />
+
+        <main className="flex-1 overflow-y-auto px-4 py-5 sm:px-6 lg:px-8 pb-20 lg:pb-8">
+          <div className="max-w-[1360px] mx-auto space-y-6">
+            {isStale && syncError && (
+              <Alert
+                variant="warning"
+                title="Showing cached state — backend synchronization delayed"
+                action={
+                  <Button
+                    variant="secondary"
+                    size="sm"
+                    loading={isRefreshing}
+                    onClick={() => void syncAll()}
+                  >
+                    Retry Sync
+                  </Button>
+                }
+              >
+                {syncError}. Previously loaded server data remains preserved while reconnection continues.
+              </Alert>
+            )}
+
+            <ErrorBoundary
+              key={activeServerId ? `srv-${activeServerId}` : `tab-${currentTab}`}
+              scopeName={getCurrentFeatureName()}
+              onReset={() => void syncAll()}
+            >
+              <Suspense
+                fallback={
+                  <div className="space-y-4" aria-busy="true" aria-label="Loading view">
+                    <Skeleton className="h-14 w-full rounded-xl" />
+                    <Skeleton className="h-72 w-full rounded-xl" />
+                  </div>
+                }
+              >
+                {activeServerId ? (
+                  <ServerDetailView
+                    serverId={activeServerId}
+                    initialServer={activeServerSummary}
+                    pendingAction={pendingActions[activeServerId]}
+                    onBack={() => setActiveServerId(null)}
+                    onStart={handleStartServer}
+                    onStop={handleStopServer}
+                    onRestart={handleRestartServer}
+                    onDelete={handleDeleteServer}
+                    onNotify={pushToast}
+                  />
+                ) : currentTab === 'dashboard' ? (
+                  <DashboardView
+                    servers={servers}
+                    runtime={runtime}
+                    activities={activities}
+                    initialLoading={initialLoading}
+                    pendingActions={pendingActions}
+                    onOpenCreate={() => setIsCreateModalOpen(true)}
+                    onSelectServer={(id) => setActiveServerId(id)}
+                    onStartServer={handleStartServer}
+                    onStopServer={handleStopServer}
+                    onRestartServer={handleRestartServer}
+                    onDeleteServer={handleDeleteServer}
+                    onNavigateTab={(tab) => setCurrentTab(tab)}
+                  />
+                ) : currentTab === 'servers' ? (
+                  <ServerListView
+                    servers={servers}
+                    initialLoading={initialLoading}
+                    pendingActions={pendingActions}
+                    onOpenCreate={() => setIsCreateModalOpen(true)}
+                    onSelectServer={(id) => setActiveServerId(id)}
+                    onStartServer={handleStartServer}
+                    onStopServer={handleStopServer}
+                    onRestartServer={handleRestartServer}
+                    onDeleteServer={handleDeleteServer}
+                  />
+                ) : currentTab === 'packages' ? (
+                  <PackagesView runtime={runtime} onNotify={pushToast} />
+                ) : currentTab === 'diagnostics' ? (
+                  <DiagnosticsView
+                    runtime={runtime}
+                    isRefreshing={isRefreshing}
+                    onRefresh={() => void syncAll()}
+                  />
+                ) : currentTab === 'activity' ? (
+                  <ActivityLogsView
+                    activities={activities}
+                    isRefreshing={isRefreshing}
+                    onRefresh={() => void syncAll()}
+                    onSelectServer={(id) => setActiveServerId(id)}
+                  />
+                ) : (
+                  <SettingsView runtime={runtime} />
+                )}
+              </Suspense>
+            </ErrorBoundary>
+          </div>
+        </main>
       </div>
 
-      {/* Create Server Modal (Responsive centered) */}
+      <MobileBottomNav
+        currentTab={currentTab}
+        onSelectTab={setCurrentTab}
+        servers={servers}
+        activeServerId={activeServerId}
+        onClearActiveServer={() => setActiveServerId(null)}
+      />
+
       <CreateServerModal
         isOpen={isCreateModalOpen}
         onClose={() => setIsCreateModalOpen(false)}
         onCreate={handleCreateServer}
-        onServerCreated={(newId) => {
-          loadAll();
-          setActiveServerId(newId);
+        onServerCreated={(serverId) => {
+          void syncAll({ silent: true });
+          setActiveServerId(serverId);
         }}
       />
+
+      <ToastViewport toasts={toasts} onDismiss={dismissToast} />
     </div>
   );
 }

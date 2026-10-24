@@ -1,239 +1,323 @@
-import React, { useState, useEffect } from 'react';
+import React, { useCallback, useEffect, useState } from 'react';
 import {
-  Package,
   CheckCircle2,
   Download,
-  Trash2,
-  Search,
+  Package,
   RefreshCw,
-  Terminal,
-  Loader2,
-  Cpu,
+  Trash2,
 } from 'lucide-react';
-import { PackageSpec, EnvironmentInfo } from '../types';
+import { EnvironmentInfo, PackageSpec, ToastItem } from '../types';
 import { fetchPackages, installPackage, uninstallPackage } from '../services/api';
+import {
+  Alert,
+  Badge,
+  Button,
+  Card,
+  CodeText,
+  ConfirmDialog,
+  EmptyState,
+  Modal,
+  PageHeader,
+  SearchInput,
+  Skeleton,
+} from './ui';
+import { isAbortError, normalizeError } from '../utils/errors';
 
-interface PackagesViewProps {
+export interface PackagesViewProps {
   runtime: EnvironmentInfo | null;
+  onNotify?: (title: string, variant?: ToastItem['variant'], description?: string) => void;
 }
 
-export const PackagesView: React.FC<PackagesViewProps> = ({ runtime }) => {
+export const PackagesView: React.FC<PackagesViewProps> = ({ runtime, onNotify }) => {
   const [packages, setPackages] = useState<PackageSpec[]>([]);
   const [loading, setLoading] = useState(true);
+  const [error, setError] = useState<string | null>(null);
   const [search, setSearch] = useState('');
   const [isBusy, setIsBusy] = useState(false);
   const [activeOp, setActiveOp] = useState('');
   const [modalOutput, setModalOutput] = useState<string | null>(null);
   const [actionLoading, setActionLoading] = useState<string | null>(null);
+  const [confirmUninstallPkg, setConfirmUninstallPkg] = useState<PackageSpec | null>(null);
 
-  const loadPackages = async () => {
+  const loadPackages = useCallback(async (signal?: AbortSignal) => {
     try {
       setLoading(true);
-      const res = await fetchPackages();
+      const res = await fetchPackages({ signal });
       setPackages(res.packages);
       setIsBusy(res.is_busy);
       setActiveOp(res.active_op);
-    } catch (err: any) {
-      console.error(err);
+      setError(null);
+    } catch (err: unknown) {
+      if (isAbortError(err)) return;
+      setError(normalizeError(err, 'Failed to load package registry').message);
     } finally {
       setLoading(false);
     }
-  };
+  }, []);
 
   useEffect(() => {
-    loadPackages();
-  }, []);
+    const controller = new AbortController();
+    const timer = globalThis.setTimeout(() => {
+      void loadPackages(controller.signal);
+    }, 0);
+    return () => {
+      globalThis.clearTimeout(timer);
+      controller.abort();
+    };
+  }, [loadPackages]);
 
   const handleInstall = async (pkg: PackageSpec) => {
     try {
       setActionLoading(pkg.id);
-      setModalOutput(`[nodepanel] Queuing install of ${pkg.name} via ${runtime?.package_manager || 'system PM'}...\n`);
+      setModalOutput(
+        `[nodepanel] Installing ${pkg.name} via ${runtime?.package_manager || 'system package manager'}...\n`
+      );
       const res = await installPackage(pkg.id);
-      setModalOutput((prev) => (prev || '') + '\n' + res.output);
-      loadPackages();
-    } catch (err: any) {
-      setModalOutput((prev) => (prev || '') + `\nInstallation Error: ${err.message}`);
+      setModalOutput((prev) => `${prev || ''}\n${res.output}`);
+      onNotify?.(`Installed ${pkg.name}`, 'success');
+      await loadPackages();
+    } catch (err: unknown) {
+      const msg = normalizeError(err, 'Package installation failed').message;
+      setModalOutput((prev) => `${prev || ''}\n[error] ${msg}`);
+      onNotify?.('Package install failed', 'error', msg);
     } finally {
       setActionLoading(null);
     }
   };
 
   const handleUninstall = async (pkg: PackageSpec) => {
-    if (!confirm(`Are you sure you want to uninstall ${pkg.name}?`)) return;
+    setConfirmUninstallPkg(null);
     try {
       setActionLoading(pkg.id);
       setModalOutput(`[nodepanel] Removing ${pkg.name}...\n`);
       const res = await uninstallPackage(pkg.id);
-      setModalOutput((prev) => (prev || '') + '\n' + res.output);
-      loadPackages();
-    } catch (err: any) {
-      setModalOutput((prev) => (prev || '') + `\nUninstall Error: ${err.message}`);
+      setModalOutput((prev) => `${prev || ''}\n${res.output}`);
+      onNotify?.(`Removed ${pkg.name}`, 'info');
+      await loadPackages();
+    } catch (err: unknown) {
+      const msg = normalizeError(err, 'Package removal failed').message;
+      setModalOutput((prev) => `${prev || ''}\n[error] ${msg}`);
+      onNotify?.('Package uninstall failed', 'error', msg);
     } finally {
       setActionLoading(null);
     }
   };
 
-  const filtered = packages.filter(
-    (p) =>
-      p.name.toLowerCase().includes(search.toLowerCase()) ||
-      p.id.toLowerCase().includes(search.toLowerCase()) ||
-      p.category.toLowerCase().includes(search.toLowerCase())
-  );
+  const filtered = packages.filter((p) => {
+    const q = search.trim().toLowerCase();
+    return (
+      !q ||
+      p.name.toLowerCase().includes(q) ||
+      p.id.toLowerCase().includes(q) ||
+      p.category.toLowerCase().includes(q) ||
+      p.executable.toLowerCase().includes(q)
+    );
+  });
 
   return (
     <div className="space-y-6">
-      <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-4">
-        <div>
-          <h2 className="text-xl font-bold text-white tracking-tight">System Packages</h2>
-          <p className="text-xs text-slate-400">
-            Environment-aware global packages mapped to <span className="font-mono text-emerald-400">{runtime?.package_manager || 'system package manager'}</span>
-          </p>
-        </div>
+      <PageHeader
+        title="System Packages"
+        description={`Environment-aware host toolchain packages mapped to ${
+          runtime?.package_manager && runtime.package_manager !== 'none'
+            ? runtime.package_manager
+            : 'detected system package manager'
+        }.`}
+        actions={
+          <Button
+            variant="secondary"
+            size="sm"
+            loading={loading}
+            onClick={() => void loadPackages()}
+            leftIcon={<RefreshCw className="w-3.5 h-3.5" />}
+          >
+            Refresh
+          </Button>
+        }
+      />
 
-        <button
-          onClick={loadPackages}
-          className="p-2 text-slate-400 hover:text-white glass-panel rounded-xl self-start sm:self-auto"
-          title="Refresh package states"
+      {error && (
+        <Alert
+          variant="error"
+          title="Unable to query host packages"
+          action={
+            <Button variant="secondary" size="sm" onClick={() => void loadPackages()}>
+              Retry
+            </Button>
+          }
         >
-          <RefreshCw className={`w-4 h-4 ${loading ? 'animate-spin' : ''}`} />
-        </button>
-      </div>
+          {error}
+        </Alert>
+      )}
 
-      {/* Package Manager Environment Banner (Bento Glass Card) */}
-      <div className="glass-panel glass-specular rounded-2xl p-5 flex flex-col md:flex-row md:items-center justify-between gap-4">
+      {isBusy && (
+        <Alert variant="warning" title="Package manager lock active">
+          Operation <CodeText>{activeOp}</CodeText> is currently running. Concurrent package mutations are serialized to prevent lock contention.
+        </Alert>
+      )}
+
+      <Card padding="md" className="flex flex-col sm:flex-row sm:items-center justify-between gap-4">
         <div className="space-y-1">
-          <div className="text-xs font-semibold text-slate-200 flex items-center gap-2">
-            <Package className="w-4 h-4 text-emerald-400" />
-            <span>Active Manager: <strong className="text-emerald-400 font-mono">{runtime?.package_manager || 'None detected'}</strong></span>
+          <div className="text-xs font-semibold text-[#F3F5F8] flex items-center gap-2">
+            <Package className="w-4 h-4 text-emerald-400" aria-hidden="true" />
+            <span>
+              Active Package Manager:{' '}
+              <CodeText>{runtime?.package_manager || 'none'}</CodeText>
+            </span>
           </div>
-          <p className="text-xs text-slate-400">
-            {runtime?.type === 'android_native' || runtime?.package_manager === 'pkg'
-              ? 'Native System: uses pkg package manager without root privilege requirement.'
+          <p className="text-xs text-[#8A94A6]">
+            {runtime?.type === 'android_native'
+              ? 'Termux native sandbox: installs packages into $PREFIX without root privileges.'
               : runtime?.type === 'ubuntu_proot'
-              ? 'Ubuntu PRoot Distro: uses apt-get repository with full glibc environment.'
-              : 'Linux environment: automated package manager detection and safety locking.'}
+              ? 'Ubuntu PRoot container: uses APT repositories with full glibc compatibility.'
+              : 'Standard Linux host: executes package commands asynchronously with shell: false.'}
           </p>
         </div>
 
-        {isBusy && (
-          <div className="flex items-center gap-2 px-3.5 py-1.5 rounded-xl bg-amber-500/10 border border-amber-500/30 text-amber-300 text-xs font-mono">
-            <Loader2 className="w-3.5 h-3.5 animate-spin" />
-            <span>Lock engaged: {activeOp}</span>
-          </div>
-        )}
-      </div>
+        <div className="w-full sm:w-72">
+          <SearchInput
+            value={search}
+            onChange={setSearch}
+            placeholder="Filter packages..."
+            aria-label="Filter system packages"
+          />
+        </div>
+      </Card>
 
-      {/* Search Input */}
-      <div className="relative">
-        <Search className="w-4 h-4 text-slate-500 absolute left-3.5 top-1/2 -translate-y-1/2" />
-        <input
-          type="text"
-          placeholder="Search package name, command or category..."
-          value={search}
-          onChange={(e) => setSearch(e.target.value)}
-          className="w-full glass-panel rounded-xl pl-10 pr-3 py-2 text-xs text-slate-200 placeholder-slate-500 focus:outline-none focus:border-emerald-400/50 transition-colors"
+      {loading && packages.length === 0 ? (
+        <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+          <Skeleton className="h-40 w-full rounded-xl" />
+          <Skeleton className="h-40 w-full rounded-xl" />
+          <Skeleton className="h-40 w-full rounded-xl" />
+          <Skeleton className="h-40 w-full rounded-xl" />
+        </div>
+      ) : filtered.length === 0 ? (
+        <EmptyState
+          icon={<Package className="w-7 h-7" />}
+          title="No packages matched"
+          description="Try clearing your search filter to view all curated host utilities."
         />
-      </div>
+      ) : (
+        <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+          {filtered.map((pkg) => {
+            const isCurrentLoading = actionLoading === pkg.id;
+            const mappedPkg = pkg.pkg_map[runtime?.package_manager || 'apt-get'] || pkg.id;
 
-      {/* Bento Grid of Packages */}
-      <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
-        {filtered.map((pkg) => {
-          const isCurrentLoading = actionLoading === pkg.id;
-
-          return (
-            <div
-              key={pkg.id}
-              className="glass-panel glass-specular glass-panel-hover rounded-2xl p-5 flex flex-col justify-between space-y-4 shadow-sm"
-            >
-              <div className="space-y-2">
-                <div className="flex items-start justify-between gap-2">
-                  <div>
-                    <h3 className="font-bold text-white text-sm">{pkg.name}</h3>
-                    <div className="text-[11px] font-mono text-slate-400 mt-0.5">
-                      Command: <code className="text-slate-200">{pkg.executable}</code>
+            return (
+              <Card key={pkg.id} padding="md" className="flex flex-col justify-between gap-4">
+                <div className="space-y-2.5">
+                  <div className="flex items-start justify-between gap-3">
+                    <div>
+                      <h3 className="text-sm font-semibold text-[#F3F5F8]">{pkg.name}</h3>
+                      <div className="text-xs text-[#8A94A6] mt-0.5 flex items-center gap-2">
+                        <span>Binary:</span>
+                        <CodeText>{pkg.executable}</CodeText>
+                        <span className="text-[#4B5565]">·</span>
+                        <span>{pkg.category}</span>
+                      </div>
                     </div>
-                  </div>
 
-                  <span className="text-[10px] font-mono text-slate-400">
                     {pkg.installed ? (
-                      <span className="text-emerald-400 font-semibold flex items-center gap-1">
-                        <CheckCircle2 className="w-3 h-3" /> Installed
-                      </span>
+                      <Badge tone="success">
+                        <CheckCircle2 className="w-3 h-3" aria-hidden="true" />
+                        <span>Installed</span>
+                      </Badge>
                     ) : (
-                      'Available'
+                      <Badge tone="neutral">Not Installed</Badge>
                     )}
-                  </span>
-                </div>
-
-                <p className="text-xs text-slate-400 leading-relaxed">{pkg.description}</p>
-
-                {pkg.installed && pkg.version && (
-                  <div className="text-[11px] font-mono text-slate-400 bg-black/30 p-2 rounded-xl border border-white/[0.04] truncate">
-                    {pkg.version}
                   </div>
-                )}
-              </div>
 
-              <div className="pt-3 border-t border-white/[0.06] flex items-center justify-between">
-                <span className="text-[10px] text-slate-500 font-mono">
-                  Package: {pkg.pkg_map[runtime?.package_manager || 'pkg'] || pkg.id}
-                </span>
+                  <p className="text-xs text-[#A2AAB8] leading-relaxed">{pkg.description}</p>
 
-                <div className="flex items-center gap-2">
-                  {pkg.installed ? (
-                    pkg.id !== 'git' && (
-                      <button
-                        onClick={() => handleUninstall(pkg)}
-                        disabled={isCurrentLoading || isBusy}
-                        className="flex items-center gap-1 px-3 py-1 text-xs text-rose-300 hover:bg-rose-500/20 border border-rose-500/30 rounded-xl transition-colors disabled:opacity-50"
-                      >
-                        <Trash2 className="w-3.5 h-3.5" />
-                        <span>Uninstall</span>
-                      </button>
-                    )
-                  ) : (
-                    <button
-                      onClick={() => handleInstall(pkg)}
-                      disabled={isCurrentLoading || isBusy}
-                      className="flex items-center gap-1.5 px-3.5 py-1.5 bg-gradient-to-r from-emerald-500 to-teal-500 hover:from-emerald-400 hover:to-teal-400 text-slate-950 font-bold text-xs rounded-xl shadow-sm transition-all disabled:opacity-50"
-                    >
-                      {isCurrentLoading ? (
-                        <Loader2 className="w-3.5 h-3.5 animate-spin" />
-                      ) : (
-                        <Download className="w-3.5 h-3.5 stroke-[2.5]" />
-                      )}
-                      <span>Install</span>
-                    </button>
+                  {pkg.installed && (pkg.version || pkg.path) && (
+                    <div className="rounded-lg bg-[#090B0E] border border-[#1A1E26] px-3 py-2 font-mono text-[11px] text-[#8A94A6] truncate">
+                      {pkg.version || 'Installed'}
+                      {pkg.path ? ` · ${pkg.path}` : ''}
+                    </div>
                   )}
                 </div>
-              </div>
-            </div>
-          );
-        })}
-      </div>
 
-      {/* Package Operation Terminal Output Modal */}
-      {modalOutput !== null && (
-        <div className="fixed inset-0 z-50 bg-black/70 backdrop-blur-md flex items-center justify-center p-4">
-          <div className="glass-panel border border-white/20 rounded-2xl max-w-2xl w-full p-6 shadow-2xl space-y-3">
-            <div className="flex items-center justify-between border-b border-white/[0.08] pb-3">
-              <h4 className="font-bold text-white text-sm flex items-center gap-2">
-                <Terminal className="w-4 h-4 text-emerald-400" />
-                <span>Package Manager Output</span>
-              </h4>
-              <button
-                onClick={() => setModalOutput(null)}
-                className="text-xs text-slate-300 hover:text-white px-3 py-1 bg-white/[0.08] rounded-lg"
-              >
-                Close
-              </button>
-            </div>
-            <pre className="bg-black/40 p-4 rounded-xl font-mono text-xs text-slate-200 max-h-80 overflow-y-auto whitespace-pre-wrap">
-              {modalOutput}
-            </pre>
-          </div>
+                <div className="pt-3 border-t border-[#181C24] flex items-center justify-between gap-2">
+                  <span className="text-[11px] font-mono text-[#697386]">
+                    Target: {mappedPkg}
+                  </span>
+
+                  {pkg.installed ? (
+                    pkg.id !== 'git' ? (
+                      <Button
+                        variant="danger"
+                        size="sm"
+                        disabled={isBusy || Boolean(actionLoading)}
+                        loading={isCurrentLoading}
+                        onClick={() => setConfirmUninstallPkg(pkg)}
+                        leftIcon={<Trash2 className="w-3.5 h-3.5" />}
+                      >
+                        Uninstall
+                      </Button>
+                    ) : (
+                      <span className="text-[11px] text-[#697386]">Protected core binary</span>
+                    )
+                  ) : (
+                    <Button
+                      variant="primary"
+                      size="sm"
+                      disabled={isBusy || Boolean(actionLoading)}
+                      loading={isCurrentLoading}
+                      onClick={() => void handleInstall(pkg)}
+                      leftIcon={<Download className="w-3.5 h-3.5" />}
+                    >
+                      Install
+                    </Button>
+                  )}
+                </div>
+              </Card>
+            );
+          })}
         </div>
       )}
+
+      <ConfirmDialog
+        isOpen={Boolean(confirmUninstallPkg)}
+        onClose={() => setConfirmUninstallPkg(null)}
+        onConfirm={() => {
+          if (confirmUninstallPkg) {
+            void handleUninstall(confirmUninstallPkg);
+          }
+        }}
+        title="Uninstall System Package?"
+        confirmLabel="Uninstall"
+        description={
+          confirmUninstallPkg ? (
+            <>
+              Remove <strong className="text-[#F3F5F8]">{confirmUninstallPkg.name}</strong> from the
+              host environment? Managed servers relying on{' '}
+              <CodeText>{confirmUninstallPkg.executable}</CodeText> may stop functioning.
+            </>
+          ) : null
+        }
+      />
+
+      <Modal
+        isOpen={modalOutput !== null}
+        onClose={() => setModalOutput(null)}
+        title="Package Operation Output"
+        size="lg"
+        preventClose={Boolean(actionLoading)}
+        footer={
+          <Button
+            variant="secondary"
+            size="sm"
+            disabled={Boolean(actionLoading)}
+            onClick={() => setModalOutput(null)}
+          >
+            Close
+          </Button>
+        }
+      >
+        <pre className="rounded-lg bg-[#090B0E] border border-[#1F242D] p-4 font-mono text-xs text-[#E2E8F0] max-h-80 overflow-y-auto whitespace-pre-wrap">
+          {modalOutput}
+        </pre>
+      </Modal>
     </div>
   );
 };

@@ -1,0 +1,549 @@
+1. ROLE & OBJECTIVE
+
+Bertindak sebagai Senior Software Engineer, Full-Stack Architect, QA Automation Engineer, UI/UX Designer, DevOps Engineer, dan Application Security Engineer.
+
+Lakukan audit mendalam terhadap seluruh repository project "panel2-main" yang sudah tersedia.
+
+Project ini SUDAH BERJALAN dan sebagian besar fungsinya sudah benar. Jangan membangun ulang dari nol, jangan mengganti arsitektur tanpa alasan teknis yang kuat, dan jangan menghilangkan fitur existing.
+
+Tugas utama:
+
+1. Menemukan akar penyebab bug, bukan sekadar menyembunyikan gejalanya.
+2. Memperbaiki bug secara minimal, terukur, dan dapat diverifikasi.
+3. Melakukan redesign frontend secara menyeluruh menjadi premium black UI/UX.
+4. Membangun reusable custom component system untuk seluruh komponen frontend.
+5. Membuat automated testing pipeline dari Static Test, Unit Test, Integration Test, E2E Test, sampai Load Test.
+6. Memastikan setiap perubahan dapat dibuktikan melalui hasil pengujian yang nyata.
+
+Jangan mengklaim suatu fitur sudah diperbaiki atau test berhasil apabila belum benar-benar dijalankan.
+
+2. PROJECT CONTEXT & CRITICAL BUGS
+
+Project memiliki dashboard untuk mengelola server lain yang dijalankan atau dihentikan melalui panel. Bedakan dengan tegas antara:
+
+- Panel/backend utama yang menyajikan dashboard dan API.
+- Managed server atau child server yang dikontrol oleh panel.
+- WebSocket untuk komunikasi realtime.
+- Frontend dashboard yang menampilkan status server.
+
+Bug A: Dashboard blank putih ketika managed server dihentikan atau direstart
+
+Reproduksi awal dari pengguna:
+
+1. Dashboard berjalan normal.
+2. Pengguna menghentikan atau merestart managed server, bukan panel utama.
+3. Dashboard mengalami relog, blank putih selama beberapa detik, atau kehilangan tampilan.
+4. Dashboard kemudian muncul kembali.
+
+Investigasi secara menyeluruh.
+
+Periksa kemungkinan berikut tanpa langsung menganggap salah satunya sebagai akar masalah:
+
+- React component crash atau uncaught exception.
+- Error boundary tidak tersedia.
+- WebSocket close, error, reconnect, atau event listener yang berjalan berulang.
+- Race condition antara polling, fetch, reconnect, dan state update.
+- React effect cleanup, StrictMode, stale closure, dan duplicate subscription.
+- Error API yang mengubah data existing menjadi array kosong.
+- Proses managed server yang secara tidak sengaja memengaruhi lifecycle panel utama.
+- Supervisor atau process manager yang mematikan proses yang salah.
+- Frontend mengakses port, URL, atau endpoint yang ikut mati ketika child server dihentikan.
+- State management yang menyebabkan unmount/remount seluruh dashboard.
+- Error handling pada JSON parsing, network timeout, HTTP error, dan WebSocket message.
+- Build/runtime error dan konfigurasi deployment.
+
+Wajib membuat reproduksi bug dan mengumpulkan bukti melalui browser console, network requests, WebSocket events, server logs, dan process lifecycle.
+
+Jangan mengatasi masalah dengan sekadar reload halaman, menyembunyikan error, atau melakukan full-page redirect setiap kali koneksi terputus.
+
+Perilaku yang diharapkan:
+
+- Ketika managed server berhenti, dashboard utama tetap terbuka dan interaktif.
+- Status server berubah secara akurat menjadi stopped, stopping, starting, atau error sesuai kondisi sebenarnya.
+- Kehilangan koneksi sementara menampilkan indikator disconnected/reconnecting, bukan blank screen.
+- Data terakhir yang valid tetap tersedia selama refresh gagal, dengan indikator bahwa datanya mungkin sudah usang.
+- Reconnect dilakukan secara terkendali dengan exponential backoff dan jitter.
+- Tidak ada reconnect timer, event listener, interval, atau subscription ganda.
+- Request yang sudah tidak relevan dibatalkan atau hasilnya diabaikan secara aman.
+- Kegagalan satu widget tidak meruntuhkan seluruh dashboard.
+- Panel utama dan managed server memiliki lifecycle yang terpisah.
+- Error yang tidak terduga tercatat dengan informasi diagnostik yang aman.
+
+Buktikan akar penyebab sebelum menyatakan bug selesai.
+
+Bug B: Server lifecycle dan komunikasi realtime
+
+Audit seluruh alur start, stop, restart, crash, exit, reconnect, dan status polling.
+
+Pastikan:
+
+- Status berasal dari kondisi proses yang sebenarnya, bukan asumsi frontend.
+- Exit code, signal, stderr, dan kegagalan startup ditangani.
+- Operasi yang berulang tidak menghasilkan child process ganda.
+- Stop/restart memiliki timeout dan penanganan proses yang tidak berhenti.
+- Listener dibersihkan dengan benar.
+- Tidak ada orphan process.
+- Tidak ada restart loop tanpa batas.
+- Operasi server memiliki state transition yang valid.
+- WebSocket reconnect tidak membuat command dieksekusi ulang.
+- Perintah yang mengubah server tidak dapat dipicu oleh pesan realtime duplikat.
+- Semua endpoint mengembalikan error response yang konsisten.
+
+Jangan mengubah supervisor, process manager, port, atau mekanisme startup tanpa terlebih dahulu memahami desain yang sedang digunakan.
+
+3. DEEP AUDIT SELURUH REPOSITORY
+
+Audit semua file relevan, termasuk:
+
+- "src/App.tsx"
+- Seluruh halaman dan komponen pada "src/components/"
+- Seluruh service API dan WebSocket.
+- Backend "server.ts".
+- Managed server di "data/servers/".
+- "package.json" dan lockfile.
+- Konfigurasi TypeScript, Vite, ESLint, dan Tailwind.
+- ".env.example".
+- Script test, deployment, setup, dan process management.
+- Error handling, logging, authentication, authorization, dan file operations.
+
+Buat "AUDIT.md" berisi:
+
+- Arsitektur dan aliran data aktual.
+- Daftar bug berdasarkan severity.
+- Root cause beserta bukti dan file/baris terkait.
+- Risiko keamanan dan reliabilitas.
+- Perbaikan yang dilakukan.
+- Test yang dijalankan dan hasilnya.
+- Risiko yang belum terselesaikan.
+
+Klasifikasikan temuan sebagai Critical, High, Medium, atau Low. Prioritaskan keamanan, kehilangan data, crash, dan lifecycle bug sebelum pekerjaan visual.
+
+Jangan mengubah file data pengguna, konfigurasi deployment, atau secret yang tidak diperlukan.
+
+4. PREMIUM BLACK UI/UX REDESIGN
+
+Lakukan redesign menyeluruh pada SEMUA halaman, bukan hanya dashboard.
+
+Arah visual:
+
+- Premium black, modern developer console, profesional, bersih, dan konsisten.
+- Background utama mendekati "#08090B".
+- Elevated surface menggunakan variasi charcoal, bukan banyak panel dengan warna berbeda.
+- Border tipis dan subtle.
+- Tipografi yang jelas, hierarki informasi kuat, spacing konsisten.
+- Aksen lime atau emerald digunakan secara terukur.
+- Status sukses, warning, error, dan disconnected harus mudah dibedakan.
+- Hindari glow berlebihan, gradient mencolok, glassmorphism berlebihan, dan dekorasi tanpa fungsi.
+- Animasi halus, singkat, dan mendukung "prefers-reduced-motion".
+- Responsif pada mobile, tablet, dan desktop.
+- Desktop tidak boleh dipaksa menggunakan layout selebar layar ponsel.
+- Semua interaksi mendukung keyboard dan focus state yang jelas.
+
+Pertahankan identitas fungsional aplikasi dan fitur existing. Jangan menghapus fitur hanya karena sulit disesuaikan dengan desain baru.
+
+5. CUSTOM DESIGN SYSTEM — WAJIB REUSABLE
+
+Buat design system yang terstruktur, reusable, bertipe jelas, dan mudah dikembangkan.
+
+Minimal sediakan komponen berikut jika sesuai dengan kebutuhan project:
+
+Foundations
+
+- Design tokens untuk warna, spacing, radius, typography, shadow, z-index, dan motion.
+- Typography primitives.
+- Surface dan layout primitives.
+- Theme variables.
+
+Interactive components
+
+- "Button"
+- "IconButton"
+- "Input"
+- "PasswordInput"
+- "Textarea"
+- "Select"
+- "Checkbox"
+- "Radio"
+- "Switch"
+- "SearchInput"
+- "Tabs"
+- "DropdownMenu"
+- "Tooltip"
+
+Feedback components
+
+- "Badge"
+- "StatusPill"
+- "Alert"
+- "Toast"
+- "InlineError"
+- "Skeleton"
+- "Spinner"
+- "ProgressBar"
+- "EmptyState"
+- "ConnectionStatus"
+
+Layout dan data
+
+- "Card"
+- "PageHeader"
+- "SectionHeader"
+- "Modal"
+- "ConfirmDialog"
+- "Drawer"
+- "Table"
+- "Pagination"
+- "StatCard"
+- "ServerCard"
+- "ActivityLog"
+- "ErrorBoundary"
+
+Sesuaikan daftar dengan kebutuhan aktual. Jangan menambah komponen kosong yang tidak dipakai.
+
+Aturan:
+
+- Semua komponen memiliki API props dan TypeScript types yang jelas.
+- Hindari penggunaan "any" tanpa alasan yang terdokumentasi.
+- Gunakan "variant", "size", "disabled", "loading", dan props lain secara konsisten.
+- Loading state tidak boleh memicu submit berulang.
+- Modal memiliki keyboard navigation, Escape handling yang aman, focus management, dan accessible labeling.
+- Input memiliki label, error state, dan deskripsi yang benar.
+- Icon-only button memiliki accessible name.
+- Jangan menggunakan warna atau class yang berbeda-beda untuk fungsi identik tanpa alasan desain.
+- Hindari duplikasi style dan logic.
+- Semua tombol, input, modal, dan elemen interaktif di seluruh halaman harus menggunakan design system jika memungkinkan.
+- Pengecualian hanya untuk elemen yang memang memerlukan implementasi khusus; dokumentasikan alasannya.
+
+Buat folder struktur yang sesuai dengan arsitektur project, misalnya "src/components/ui/" dan "src/styles/", tanpa memaksakan struktur baru yang tidak diperlukan.
+
+6. IMPLEMENTASI SELURUH HALAMAN
+
+Audit dan sesuaikan setiap halaman yang benar-benar ada di project, termasuk jika tersedia:
+
+- Dashboard.
+- Server list dan server detail.
+- Create server modal.
+- Activity logs.
+- Diagnostics.
+- Terminal.
+- File manager atau file editor.
+- Package management.
+- Settings.
+- Confirmation dialogs.
+- Loading, error, empty, offline, dan reconnect states.
+
+Jangan mengarang halaman baru lalu mengabaikan fitur existing.
+
+Setiap halaman harus konsisten secara visual dan perilaku.
+
+Khusus dashboard, tampilkan:
+
+- Status panel dan koneksi realtime.
+- Status server yang dikelola.
+- CPU, RAM, storage, atau metrik lain hanya jika datanya benar-benar tersedia.
+- Aksi start, stop, restart, dan detail.
+- Recent activity.
+- Error dan warning yang relevan.
+- Loading state dan stale-data indicator saat backend tidak dapat dijangkau.
+
+Jangan menampilkan metrik palsu atau data hardcoded seolah-olah merupakan data aktual.
+
+7. TESTING PIPELINE WAJIB
+
+Implementasikan pipeline berikut secara berurutan. Setiap tahap harus memiliki command yang nyata dan exit code yang dapat diverifikasi.
+
+Stage 1 — Static Test
+
+Periksa dan konfigurasi sesuai stack yang benar-benar digunakan:
+
+- TypeScript typecheck.
+- ESLint.
+- Build production.
+- Formatting check jika formatter digunakan.
+- Pemeriksaan dependency dan konfigurasi yang relevan.
+
+Script yang diharapkan jika sesuai dengan project:
+
+- "npm run typecheck"
+- "npm run lint"
+- "npm run build"
+
+Jangan menambahkan script yang hanya mencetak pesan sukses tanpa melakukan pemeriksaan.
+
+Perbaiki semua error baru akibat perubahan. Jangan mematikan aturan lint secara global hanya agar test lulus.
+
+Stage 2 — Unit Test
+
+Gunakan test framework yang kompatibel dengan stack project, misalnya Vitest untuk TypeScript/Vite jika sesuai.
+
+Uji logika kecil secara terisolasi, termasuk:
+
+- State transition server.
+- API response parsing.
+- Error normalization.
+- Reconnect backoff.
+- Timer cleanup.
+- Retry limits.
+- Validation.
+- Utility functions.
+- Format metrik.
+- Komponen UI penting dan state interaksinya.
+
+Mock network dan timer secara deterministik.
+
+Tambahkan regression test untuk setiap bug yang diperbaiki.
+
+Command contoh: "npm run test:unit".
+
+Stage 3 — Integration Test
+
+Uji komunikasi nyata antarbagian aplikasi menggunakan server dan dependency pengujian yang terisolasi.
+
+Cakupan minimal:
+
+- Frontend service ke backend API.
+- HTTP status dan JSON response.
+- Authentication dan authorization jika tersedia.
+- WebSocket connect, disconnect, reconnect, dan event delivery.
+- Server lifecycle endpoint.
+- Error handling saat backend tidak tersedia.
+- Validasi input dan invalid request.
+- File operation dan persistence jika tersedia.
+- Database integration jika project benar-benar menggunakan database.
+
+Jika project tidak menggunakan database, jangan membuat database baru hanya untuk memenuhi checklist. Uji persistence atau storage yang memang digunakan.
+
+Gunakan temporary directory, test fixtures, mock external services bila perlu, dan cleanup yang terjamin.
+
+Command contoh: "npm run test:integration".
+
+Stage 4 — E2E Browser Automation
+
+Gunakan Playwright atau browser automation setara yang kompatibel dengan project.
+
+Jalankan frontend dan backend pada environment pengujian, bukan pada panel production.
+
+Test skenario berikut:
+
+1. Dashboard berhasil dibuka dan tidak blank.
+2. Navigasi antarhalaman bekerja.
+3. Create server modal bisa dibuka, divalidasi, dan ditutup.
+4. Start, stop, dan restart server memutakhirkan status dengan benar.
+5. Tombol disabled dan loading bekerja selama request berlangsung.
+6. Modal konfirmasi tidak menjalankan aksi sebelum dikonfirmasi.
+7. Terminal, file manager, dan aktivitas diuji jika tersedia.
+8. WebSocket disconnect dan reconnect tidak merusak dashboard.
+9. Managed server dihentikan ketika dashboard tetap terbuka.
+10. Managed server direstart ketika dashboard tetap terbuka.
+11. API sementara tidak tersedia, lalu kembali online.
+12. Navigasi dan interaksi keyboard berjalan.
+13. Browser console tidak memiliki error yang berasal dari aplikasi.
+14. Tidak terjadi request loop, duplicate command, atau infinite loading.
+
+Skenario stop/restart wajib memverifikasi bahwa halaman dashboard tidak melakukan full-page reload tanpa alasan.
+
+Gunakan locator yang stabil seperti role, label, dan test ID. Jangan menggunakan selector rapuh yang bergantung pada struktur DOM yang tidak penting.
+
+Ambil screenshot saat gagal dan simpan trace, console log, serta network diagnostics bila memungkinkan.
+
+Command contoh: "npm run test:e2e".
+
+Stage 5 — Load Test
+
+Gunakan tool seperti k6 atau Artillery sesuai stack dan kemampuan environment.
+
+Jalankan terhadap test environment yang aman. Jangan mengirim traffic ke production atau endpoint publik tanpa izin eksplisit.
+
+Uji secara bertahap:
+
+- Smoke test dengan traffic minimal.
+- Ramp-up traffic secara bertahap.
+- Sustained load.
+- Burst/spike test jika aman.
+- WebSocket concurrency jika fitur dan tool mendukung.
+- Recovery setelah traffic diturunkan.
+
+Pantau:
+
+- Request throughput.
+- p50, p95, dan p99 latency.
+- HTTP error rate.
+- Timeout.
+- CPU dan memory.
+- WebSocket disconnect rate.
+- Proses yang bocor.
+- Stabilitas API dan dashboard.
+- Recovery setelah beban berhenti.
+
+Jangan menentukan batas kapasitas berdasarkan tebakan. Catat environment, concurrency, durasi, threshold yang digunakan, dan alasan pemilihannya.
+
+Gunakan threshold awal yang masuk akal untuk test environment dan sesuaikan dengan baseline aktual.
+
+Jangan menyebut sistem production-ready hanya karena load test dengan traffic kecil berhasil.
+
+Command contoh: "npm run test:load".
+
+8. CI PIPELINE DAN QUALITY GATES
+
+Buat pipeline otomatis, misalnya GitHub Actions jika repository memang menggunakan GitHub.
+
+Urutan pipeline:
+
+1. Install dependency secara reproducible menggunakan lockfile.
+2. Static checks.
+3. Unit tests.
+4. Integration tests.
+5. Production build.
+6. E2E tests.
+7. Load test sebagai job terpisah atau scheduled/manual workflow.
+
+Load test tidak harus berjalan pada setiap pull request apabila terlalu berat. Namun harus tersedia command dan workflow yang dapat dijalankan, dengan environment yang jelas.
+
+Setiap stage harus:
+
+- Mengembalikan exit code yang benar.
+- Menyimpan test report dan artefak yang relevan.
+- Menghentikan pipeline jika quality gate gagal.
+- Tidak menyamarkan kegagalan dengan "|| true".
+- Tidak menggunakan credential production.
+- Memiliki cleanup yang aman.
+
+Sediakan satu command untuk menjalankan seluruh tahap yang layak dijalankan secara lokal, misalnya "npm run test:all", dan pisahkan load test bila diperlukan.
+
+9. SECURITY DAN STABILITY AUDIT
+
+Periksa:
+
+- Secrets dan environment variables.
+- Authentication, session, dan authorization.
+- Command injection pada terminal atau process execution.
+- Path traversal pada file manager.
+- Arbitrary file read/write.
+- Unsafe shell arguments.
+- WebSocket origin dan authorization checks.
+- Request validation.
+- CORS dan security headers.
+- Error response yang membocorkan detail sensitif.
+- Dependency vulnerabilities.
+- Resource leaks dan process cleanup.
+- Permission boundary antarserver.
+- Rate limiting pada endpoint sensitif bila diperlukan.
+
+Jangan melakukan destructive security test pada production. Jangan mengekspos ".env", token, password, atau private key pada logs, reports, atau screenshot.
+
+Jangan memperbaiki keamanan dengan menghilangkan fitur tanpa menyediakan implementasi yang benar.
+
+10. PERFORMANCE DAN ACCESSIBILITY
+
+Audit dan optimalkan:
+
+- Re-render yang tidak diperlukan.
+- Polling yang tidak efisien.
+- Duplicate network requests.
+- Event listener dan timer cleanup.
+- Bundle size dan dependency.
+- Responsive overflow.
+- Keyboard navigation.
+- Semantic HTML.
+- Accessible labels.
+- Contrast.
+- Reduced motion.
+- Focus visibility.
+
+Jangan melakukan premature optimization tanpa evidence.
+
+11. WORKFLOW WAJIB
+
+Kerjakan dengan urutan berikut:
+
+Phase A — Discovery:
+
+- Baca seluruh source dan konfigurasi relevan.
+- Pahami architecture dan lifecycle.
+- Jalankan baseline tests yang sudah tersedia.
+- Catat bug dan kegagalan awal.
+
+Phase B — Reproduction:
+
+- Reproduksi bug blank screen.
+- Identifikasi log, network event, dan component yang terlibat.
+- Tulis regression test sebelum atau bersamaan dengan perbaikan.
+
+Phase C — Root-cause fixes:
+
+- Perbaiki lifecycle, error handling, state management, dan API/WebSocket.
+- Pastikan panel utama tetap hidup ketika managed server berhenti.
+- Jangan lanjut mengklaim selesai jika penyebabnya belum diketahui.
+
+Phase D — Design system:
+
+- Bangun tokens dan reusable components.
+- Migrasikan seluruh halaman.
+- Pertahankan semua fitur.
+- Periksa mobile, tablet, dan desktop.
+
+Phase E — Test coverage:
+
+- Tambahkan unit dan integration tests.
+- Tambahkan browser E2E tests.
+- Tambahkan load-test scripts dan CI quality gates.
+
+Phase F — Verification:
+
+- Jalankan test pipeline secara berurutan.
+- Perbaiki regression.
+- Ulangi test yang terdampak.
+- Catat hasil yang sebenarnya.
+
+Phase G — Delivery:
+
+- Buat "AUDIT.md".
+- Buat "TESTING.md" berisi setup, commands, test coverage, dan cara mereproduksi bug.
+- Buat laporan akhir beserta bukti hasil pengujian.
+
+Lakukan perubahan langsung pada repository yang diberikan. Jangan berhenti hanya setelah membuat rencana atau memberikan contoh kode.
+
+Jika environment tidak mendukung suatu test, dokumentasikan hambatannya, siapkan implementasi test yang bisa dijalankan, dan tandai sebagai NOT RUN. Jangan menyebutnya PASS.
+
+12. DEFINITION OF DONE
+
+Project baru boleh dinyatakan selesai jika:
+
+- Root cause blank screen sudah dibuktikan dan diperbaiki, atau keterbatasan yang menghalangi pembuktian dinyatakan secara eksplisit.
+- Dashboard tetap hidup ketika managed server dihentikan atau direstart.
+- Tidak ada regression terhadap fitur existing.
+- Semua halaman sudah memakai custom design system secara konsisten.
+- Semua komponen interaktif memiliki loading, error, disabled, dan accessibility behavior yang sesuai.
+- Static tests lulus.
+- Unit tests lulus.
+- Integration tests lulus.
+- E2E tests lulus pada skenario kritis.
+- Load test benar-benar dijalankan pada environment yang sesuai, atau secara eksplisit dilaporkan NOT RUN beserta alasannya.
+- Tidak ada secret atau data pengguna yang terekspos.
+- Production build berhasil.
+- Semua perubahan terdokumentasi.
+
+Buat tabel final:
+
+Stage| Status| Evidence| Remaining Issues
+Static| PASS/FAIL/NOT RUN| Command + result| Details
+Unit| PASS/FAIL/NOT RUN| Test report| Details
+Integration| PASS/FAIL/NOT RUN| Test report| Details
+E2E| PASS/FAIL/NOT RUN| Report/screenshots| Details
+Load| PASS/FAIL/NOT RUN| Metrics/report| Details
+Production build| PASS/FAIL/NOT RUN| Build output| Details
+
+Jangan memberikan status PASS berdasarkan asumsi.
+
+FINAL INSTRUCTION
+
+Prioritaskan correctness, reliability, security, maintainability, dan verifiable evidence di atas kecepatan.
+
+Jangan menghapus fitur.
+Jangan mengganti stack tanpa alasan.
+Jangan mematikan test untuk membuat pipeline hijau.
+Jangan membuat mock seolah-olah data produksi.
+Jangan menyatakan test berhasil jika tidak dijalankan.
+Jangan menyatakan bug selesai hanya karena gejalanya hilang sesaat.
+
+Mulai dengan audit repository yang sebenarnya, lalu kerjakan implementasi dan verifikasi sampai batas kemampuan environment. Laporkan secara jujur apa yang sudah selesai, apa yang gagal, dan apa yang belum diuji.

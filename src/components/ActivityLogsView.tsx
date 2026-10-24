@@ -1,96 +1,129 @@
-import React, { useState } from 'react';
-import { Activity, Search, CheckCircle2, AlertCircle, Clock } from 'lucide-react';
-import { ActivityLog } from '../types';
+import React, { useMemo, useState } from 'react';
+import { Activity, RefreshCw } from 'lucide-react';
+import { ActivityLog as ActivityLogModel } from '../types';
+import {
+  ActivityLog,
+  Button,
+  EmptyState,
+  PageHeader,
+  Pagination,
+  SearchInput,
+  Tabs,
+} from './ui';
 
-interface ActivityLogsViewProps {
-  activities: ActivityLog[];
+export interface ActivityLogsViewProps {
+  activities: ActivityLogModel[];
+  isRefreshing?: boolean;
   onRefresh: () => void;
+  onSelectServer?: (serverId: string) => void;
 }
 
-export const ActivityLogsView: React.FC<ActivityLogsViewProps> = ({ activities, onRefresh }) => {
-  const [search, setSearch] = useState('');
+type AuditFilter = 'all' | 'success' | 'failed';
+const PAGE_SIZE = 20;
 
-  const filtered = activities.filter(
-    (a) =>
-      a.action.toLowerCase().includes(search.toLowerCase()) ||
-      a.server_id.toLowerCase().includes(search.toLowerCase()) ||
-      a.details.toLowerCase().includes(search.toLowerCase())
-  );
+export const ActivityLogsView: React.FC<ActivityLogsViewProps> = ({
+  activities,
+  isRefreshing = false,
+  onRefresh,
+  onSelectServer,
+}) => {
+  const [search, setSearch] = useState('');
+  const [statusFilter, setStatusFilter] = useState<AuditFilter>('all');
+  const [page, setPage] = useState(1);
+
+  const filtered = useMemo(() => {
+    const q = search.trim().toLowerCase();
+    return activities.filter((a) => {
+      const matchesQuery =
+        !q ||
+        a.action.toLowerCase().includes(q) ||
+        a.server_id.toLowerCase().includes(q) ||
+        a.details.toLowerCase().includes(q);
+      if (!matchesQuery) return false;
+      if (statusFilter === 'success') return a.status === 'success';
+      if (statusFilter === 'failed') return a.status === 'failed' || a.status === 'warning';
+      return true;
+    });
+  }, [activities, search, statusFilter]);
+
+  const totalPages = Math.max(1, Math.ceil(filtered.length / PAGE_SIZE));
+  const safePage = Math.min(page, totalPages);
+  const paged = filtered.slice((safePage - 1) * PAGE_SIZE, safePage * PAGE_SIZE);
 
   return (
-    <div className="space-y-6 max-w-5xl">
-      <div className="flex items-center justify-between">
-        <div>
-          <h2 className="text-xl font-bold text-white tracking-tight flex items-center gap-2">
-            <Activity className="w-5 h-5 text-cyan-400" />
-            <span>Activity Audit Log</span>
-          </h2>
-          <p className="text-xs text-slate-400">
-            Immutable SQLite transaction record of system events, process lifecycles, and user actions
-          </p>
+    <div className="space-y-6">
+      <PageHeader
+        title="Activity Audit Log"
+        description="Chronological record of server lifecycle transitions, file edits, package operations, and configuration changes persisted to data/nodepanel.json."
+        actions={
+          <Button
+            variant="secondary"
+            size="sm"
+            loading={isRefreshing}
+            onClick={onRefresh}
+            leftIcon={<RefreshCw className="w-3.5 h-3.5" />}
+          >
+            Refresh
+          </Button>
+        }
+      />
+
+      <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3">
+        <div className="w-full sm:max-w-sm">
+          <SearchInput
+            value={search}
+            onChange={(val) => {
+              setSearch(val);
+              setPage(1);
+            }}
+            placeholder="Filter by action, server ID, or details..."
+            aria-label="Filter activity logs"
+          />
         </div>
 
-        <button
-          onClick={onRefresh}
-          className="px-4 py-2 bg-white/[0.06] hover:bg-white/[0.1] text-slate-200 text-xs font-semibold rounded-xl border border-white/[0.08]"
-        >
-          Refresh
-        </button>
-      </div>
-
-      <div className="relative">
-        <Search className="w-4 h-4 text-slate-500 absolute left-3.5 top-1/2 -translate-y-1/2" />
-        <input
-          type="text"
-          placeholder="Filter by action, server ID, or details..."
-          value={search}
-          onChange={(e) => setSearch(e.target.value)}
-          className="w-full glass-panel rounded-xl pl-10 pr-3 py-2 text-xs text-slate-200 placeholder-slate-500 focus:outline-none focus:border-cyan-400/50 transition-colors"
+        <Tabs<AuditFilter>
+          size="sm"
+          ariaLabel="Filter audit status"
+          value={statusFilter}
+          onChange={(val) => {
+            setStatusFilter(val);
+            setPage(1);
+          }}
+          items={[
+            { id: 'all', label: 'All', count: activities.length },
+            {
+              id: 'success',
+              label: 'Succeeded',
+              count: activities.filter((a) => a.status === 'success').length,
+            },
+            {
+              id: 'failed',
+              label: 'Errors',
+              count: activities.filter((a) => a.status !== 'success').length,
+            },
+          ]}
         />
       </div>
 
       {filtered.length === 0 ? (
-        <div className="glass-panel p-12 text-center text-slate-500 rounded-2xl">
-          No activity logs recorded yet.
-        </div>
+        <EmptyState
+          icon={<Activity className="w-7 h-7" />}
+          title="No matching audit events"
+          description={
+            activities.length === 0
+              ? 'Lifecycle events and configuration updates will appear here automatically.'
+              : 'Clear your search filter to see all recorded audit entries.'
+          }
+        />
       ) : (
-        <div className="glass-panel rounded-2xl divide-y divide-white/[0.06] overflow-hidden">
-          {filtered.map((log) => {
-            const isSuccess = log.status === 'success';
-
-            return (
-              <div
-                key={log.id}
-                className="p-4 flex items-start justify-between gap-4 hover:bg-white/[0.02] transition-colors"
-              >
-                <div className="flex items-start gap-3">
-                  <div className="mt-0.5">
-                    {isSuccess ? (
-                      <CheckCircle2 className="w-4 h-4 text-emerald-400" />
-                    ) : (
-                      <AlertCircle className="w-4 h-4 text-rose-400" />
-                    )}
-                  </div>
-                  <div>
-                    <div className="flex items-center gap-2">
-                      <span className="font-mono font-bold text-slate-200 text-xs">{log.action}</span>
-                      {log.server_id && (
-                        <span className="font-mono text-[11px] text-slate-400">
-                          {log.server_id}
-                        </span>
-                      )}
-                    </div>
-                    <p className="text-xs text-slate-400 mt-1 leading-relaxed">{log.details}</p>
-                  </div>
-                </div>
-
-                <div className="text-[11px] font-mono text-slate-500 whitespace-nowrap shrink-0 flex items-center gap-1">
-                  <Clock className="w-3 h-3" />
-                  <span>{new Date(log.timestamp).toLocaleString()}</span>
-                </div>
-              </div>
-            );
-          })}
+        <div className="space-y-3">
+          <ActivityLog items={paged} onSelectServer={onSelectServer} />
+          <Pagination
+            page={safePage}
+            pageSize={PAGE_SIZE}
+            totalItems={filtered.length}
+            onPageChange={setPage}
+          />
         </div>
       )}
     </div>

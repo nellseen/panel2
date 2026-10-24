@@ -1,84 +1,94 @@
 import React from 'react';
-import { Settings, Shield, HardDrive, Cpu } from 'lucide-react';
+import { Cpu, HardDrive, Lock, Shield } from 'lucide-react';
 import { EnvironmentInfo } from '../types';
+import { Card, CodeText, PageHeader } from './ui';
 
-interface SettingsViewProps {
+export interface SettingsViewProps {
   runtime: EnvironmentInfo | null;
 }
 
 export const SettingsView: React.FC<SettingsViewProps> = ({ runtime }) => {
+  const activePort = runtime?.panel_port || 3000;
+
   return (
-    <div className="space-y-6 max-w-4xl">
-      <div>
-        <h2 className="text-xl font-bold text-white tracking-tight flex items-center gap-2">
-          <Settings className="w-5 h-5 text-emerald-400" />
-          <span>Panel Configuration & Security</span>
-        </h2>
-        <p className="text-xs text-slate-400">
-          Daemon execution parameters, network bindings, and process supervisor policies
-        </p>
-      </div>
+    <div className="space-y-6">
+      <PageHeader
+        title="Panel Settings & Security Architecture"
+        description="Active daemon configuration, process group supervision parameters, and filesystem sandboxing rules."
+      />
 
-      {/* Bento Grid */}
-      <div className="grid grid-cols-1 md:grid-cols-2 gap-5">
-        {/* Network & Binding Security */}
-        <div className="glass-panel glass-specular rounded-2xl p-6 space-y-4">
-          <h3 className="text-sm font-bold text-white flex items-center gap-2">
-            <Shield className="w-4 h-4 text-emerald-400" />
-            <span>Network Binding & Loopback Security</span>
-          </h3>
-          <p className="text-xs text-slate-300 leading-relaxed">
-            By default, NodePanel binds strictly to the loopback interface (<code className="text-emerald-400 font-mono">127.0.0.1</code>) to prevent unauthorized access across local Wi-Fi or cellular networks.
+      <div className="grid grid-cols-1 lg:grid-cols-2 gap-5">
+        <Card padding="lg" className="space-y-4">
+          <div className="flex items-center gap-2 text-sm font-semibold text-[#F3F5F8]">
+            <Shield className="w-4 h-4 text-emerald-400" aria-hidden="true" />
+            <span>Network &amp; Origin Protection</span>
+          </div>
+          <p className="text-xs text-[#8A94A6] leading-relaxed">
+            NodePanel validates HTTP <CodeText>Origin</CodeText> and WebSocket upgrade headers against
+            trusted host origins, applies sliding-window API rate limiting, and supports optional
+            Bearer/API-key enforcement via <CodeText>API_SECRET_KEY</CodeText>.
           </p>
 
-          <div className="bg-black/30 p-4 rounded-xl border border-white/[0.04] space-y-2 text-xs font-mono">
-            <div className="flex justify-between py-1 border-b border-white/[0.04]">
-              <span className="text-slate-400">DEFAULT BIND HOST</span>
-              <span className="text-slate-200">127.0.0.1 (Localhost Only)</span>
+          <div className="rounded-lg bg-[#090B0E] border border-[#1A1E26] divide-y divide-[#181C24] text-xs font-mono">
+            <div className="flex items-center justify-between px-3.5 py-2.5">
+              <span className="text-[#8A94A6] font-sans">Active Panel Port</span>
+              <span className="text-[#F3F5F8]">:{activePort}</span>
             </div>
-            <div className="flex justify-between py-1 border-b border-white/[0.04]">
-              <span className="text-slate-400">DEFAULT DAEMON PORT</span>
-              <span className="text-slate-200">8080 (or custom via --port)</span>
+            <div className="flex items-center justify-between px-3.5 py-2.5">
+              <span className="text-[#8A94A6] font-sans">WebSocket Endpoint</span>
+              <span className="text-[#F3F5F8]">/ws (25s ping/pong heartbeat)</span>
             </div>
-            <div className="flex justify-between py-1">
-              <span className="text-slate-400">STORAGE PERSISTENCE</span>
-              <span className="text-emerald-400">SQLite (WAL Mode)</span>
+            <div className="flex items-center justify-between px-3.5 py-2.5">
+              <span className="text-[#8A94A6] font-sans">Cross-Origin Policy</span>
+              <span className="text-emerald-400">Same-Origin / Allowlist</span>
             </div>
           </div>
-        </div>
+        </Card>
 
-        {/* Process Supervisor Rules */}
-        <div className="glass-panel glass-specular rounded-2xl p-6 space-y-4">
-          <h3 className="text-sm font-bold text-white flex items-center gap-2">
-            <Cpu className="w-4 h-4 text-cyan-400" />
-            <span>Process Supervisor & Limits</span>
-          </h3>
-          <p className="text-xs text-slate-300 leading-relaxed">
-            Node.js package installation (<code className="text-cyan-400 font-mono">npm install</code>) is memory-intensive. On mobile devices, NodePanel enforces a hardware-safe concurrency semaphore (max 1 concurrent install) to prevent Low Memory Killer (OOM).
+        <Card padding="lg" className="space-y-4">
+          <div className="flex items-center gap-2 text-sm font-semibold text-[#F3F5F8]">
+            <Cpu className="w-4 h-4 text-emerald-400" aria-hidden="true" />
+            <span>Process Supervision &amp; Limits</span>
+          </div>
+          <p className="text-xs text-[#8A94A6] leading-relaxed">
+            Managed Node.js instances run in detached POSIX process groups so stopping or restarting
+            terminates the entire process tree cleanly with zero orphan child processes.
           </p>
 
-          <div className="bg-black/30 p-4 rounded-xl border border-white/[0.04] space-y-2 text-xs font-mono">
-            <div className="flex justify-between py-1 border-b border-white/[0.04]">
-              <span className="text-slate-400">CONCURRENT INSTALL LIMIT</span>
-              <span className="text-slate-200">1 Task (OOM Guard)</span>
+          <div className="rounded-lg bg-[#090B0E] border border-[#1A1E26] divide-y divide-[#181C24] text-xs font-mono">
+            <div className="flex items-center justify-between px-3.5 py-2.5">
+              <span className="text-[#8A94A6] font-sans">Crash Auto-Restart Cap</span>
+              <span className="text-[#F3F5F8]">Max 5 retries (linear backoff)</span>
             </div>
-            <div className="flex justify-between py-1">
-              <span className="text-slate-400">CONSOLE BUFFER</span>
-              <span className="text-slate-200">1,000 Lines (Ring Buffer)</span>
+            <div className="flex items-center justify-between px-3.5 py-2.5">
+              <span className="text-[#8A94A6] font-sans">Graceful Stop Signal</span>
+              <span className="text-[#F3F5F8]">SIGTERM → 3s → SIGKILL</span>
+            </div>
+            <div className="flex items-center justify-between px-3.5 py-2.5">
+              <span className="text-[#8A94A6] font-sans">In-Memory Log Ring Buffer</span>
+              <span className="text-[#F3F5F8]">1,000 lines / instance</span>
             </div>
           </div>
-        </div>
+        </Card>
 
-        {/* Storage Architecture (Full width) */}
-        <div className="md:col-span-2 glass-panel rounded-2xl p-6 space-y-3">
-          <h3 className="text-sm font-bold text-white flex items-center gap-2">
-            <HardDrive className="w-4 h-4 text-emerald-400" />
-            <span>Storage & Directory Structure</span>
-          </h3>
-          <p className="text-xs text-slate-400 leading-relaxed">
-            Each server instance resides in its own isolated directory under <code className="text-slate-200 font-mono">data/servers/&lt;server-id&gt;/</code>. Path traversal defense prevents files from escaping the server boundary.
+        <Card padding="lg" className="lg:col-span-2 space-y-3">
+          <div className="flex items-center gap-2 text-sm font-semibold text-[#F3F5F8]">
+            <HardDrive className="w-4 h-4 text-emerald-400" aria-hidden="true" />
+            <span>Atomic Storage &amp; Workspace Sandboxing</span>
+          </div>
+          <p className="text-xs text-[#8A94A6] leading-relaxed">
+            Panel metadata is persisted atomically via write-then-rename to{' '}
+            <CodeText>data/nodepanel.json</CodeText> (overrideable via{' '}
+            <CodeText>NODEPANEL_DATA_DIR</CodeText>). Each managed server is strictly confined to{' '}
+            <CodeText>data/servers/&lt;server-id&gt;/</CodeText> with canonical{' '}
+            <CodeText>realpath</CodeText> boundary enforcement against directory traversal and symbolic
+            link escapes.
           </p>
-        </div>
+          <div className="flex items-center gap-2 text-xs text-[#697386] pt-1">
+            <Lock className="w-3.5 h-3.5 text-emerald-400 shrink-0" aria-hidden="true" />
+            <span>Child commands execute asynchronously with shell: false to prevent command injection.</span>
+          </div>
+        </Card>
       </div>
     </div>
   );

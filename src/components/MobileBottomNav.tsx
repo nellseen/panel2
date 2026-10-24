@@ -1,15 +1,15 @@
 import React from 'react';
 import {
-  LayoutDashboard,
-  Server,
-  Package,
   Activity,
+  LayoutDashboard,
+  Package,
+  Server,
   Stethoscope,
 } from 'lucide-react';
-import { TabType } from './Sidebar';
-import { ServerModel } from '../types';
+import { ServerModel, TabType } from '../types';
+import { focusRingClasses } from '../styles/tokens';
 
-interface MobileBottomNavProps {
+export interface MobileBottomNavProps {
   currentTab: TabType;
   onSelectTab: (tab: TabType) => void;
   servers: ServerModel[];
@@ -26,37 +26,29 @@ export const MobileBottomNav: React.FC<MobileBottomNavProps> = ({
 }) => {
   const runningCount = servers.filter((s) => s.status === 'running').length;
 
-  const items = [
+  const items: Array<{
+    id: TabType;
+    label: string;
+    icon: React.ComponentType<{ className?: string }>;
+    counter?: string;
+  }> = [
+    { id: 'dashboard', label: 'Overview', icon: LayoutDashboard },
     {
-      id: 'dashboard' as TabType,
-      label: 'Home',
-      icon: LayoutDashboard,
-    },
-    {
-      id: 'servers' as TabType,
+      id: 'servers',
       label: 'Servers',
       icon: Server,
-      badge: `${runningCount}/${servers.length}`,
+      counter: servers.length > 0 ? `${runningCount}/${servers.length}` : undefined,
     },
-    {
-      id: 'packages' as TabType,
-      label: 'Packages',
-      icon: Package,
-    },
-    {
-      id: 'diagnostics' as TabType,
-      label: 'Doctor',
-      icon: Stethoscope,
-    },
-    {
-      id: 'activity' as TabType,
-      label: 'Logs',
-      icon: Activity,
-    },
+    { id: 'packages', label: 'Packages', icon: Package },
+    { id: 'diagnostics', label: 'Doctor', icon: Stethoscope },
+    { id: 'activity', label: 'Activity', icon: Activity },
   ];
 
   return (
-    <nav className="fixed bottom-0 inset-x-0 z-40 max-w-md mx-auto bg-slate-950/95 backdrop-blur-2xl border-t border-white/[0.08] px-2 py-1.5 flex items-center justify-around shadow-[0_-10px_25px_rgba(0,0,0,0.5)]">
+    <nav
+      aria-label="Mobile bottom navigation"
+      className="lg:hidden fixed bottom-0 inset-x-0 z-30 h-14 bg-[#0B0D10] border-t border-[#1A1E26] px-2 flex items-center justify-around"
+    >
       {items.map((item) => {
         const Icon = item.icon;
         const isActive = !activeServerId && currentTab === item.id;
@@ -64,32 +56,25 @@ export const MobileBottomNav: React.FC<MobileBottomNavProps> = ({
         return (
           <button
             key={item.id}
+            type="button"
+            aria-current={isActive ? 'page' : undefined}
             onClick={() => {
               onClearActiveServer();
               onSelectTab(item.id);
             }}
-            className={`flex flex-col items-center justify-center py-1 px-2.5 rounded-xl transition-all relative min-w-[56px] ${
-              isActive
-                ? 'text-emerald-300 font-bold scale-105'
-                : 'text-slate-400 hover:text-slate-200'
+            className={`flex-1 min-h-[44px] flex flex-col items-center justify-center rounded-lg transition-colors duration-150 ${focusRingClasses} ${
+              isActive ? 'text-[#F3F5F8] font-semibold' : 'text-[#8A94A6] hover:text-[#D0D7E2]'
             }`}
           >
-            <div className="relative">
-              <Icon
-                className={`w-4 h-4 transition-transform ${
-                  isActive ? 'text-emerald-400 stroke-[2.5]' : 'text-slate-400'
-                }`}
-              />
-              {item.badge && servers.length > 0 && (
-                <span className="absolute -top-1.5 -right-3 text-[9px] font-mono px-1 rounded-full bg-emerald-500/20 text-emerald-300 border border-emerald-500/30 leading-tight font-semibold">
-                  {item.badge}
+            <div className="flex items-center gap-1">
+              <Icon className={`w-4 h-4 ${isActive ? 'text-emerald-400' : 'text-[#697386]'}`} />
+              {item.counter && (
+                <span className="text-[10px] font-mono tabular-nums text-[#8A94A6]">
+                  {item.counter}
                 </span>
               )}
             </div>
-            <span className="text-[10px] mt-0.5 tracking-tight">{item.label}</span>
-            {isActive && (
-              <span className="w-1 h-1 rounded-full bg-emerald-400 mt-0.5 shadow-[0_0_6px_rgba(16,185,129,0.9)]" />
-            )}
+            <span className="text-[10px] mt-0.5">{item.label}</span>
           </button>
         );
       })}
